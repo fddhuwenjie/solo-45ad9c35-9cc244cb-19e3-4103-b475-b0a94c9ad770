@@ -62,11 +62,16 @@ def _add_flag(db, batch_id, workpiece_id, code, detail):
 
 
 def _cure_for_item(db, batch_id, workpiece_id):
-    """按工件自身粉料窗口评估固化（窗口交集只用于排产，判定按各件自身窗口）。"""
-    powder = db.execute(
-        "SELECT p.* FROM workpieces w JOIN powders p ON p.batch_no = w.powder_batch"
-        " WHERE w.id=?",
-        (workpiece_id,),
+    """按工件固化窗口评估。已签发炉次用签发快照，草稿用当前主数据。"""
+    row = db.execute(
+        "SELECT COALESCE(bi.snap_temp_min_c, p.temp_min_c) AS temp_min_c,"
+        " COALESCE(bi.snap_temp_max_c, p.temp_max_c) AS temp_max_c,"
+        " COALESCE(bi.snap_hold_minutes, p.hold_minutes) AS hold_minutes"
+        " FROM batch_items bi"
+        " JOIN workpieces w ON w.id = bi.workpiece_id"
+        " LEFT JOIN powders p ON p.batch_no = w.powder_batch"
+        " WHERE bi.batch_id=? AND bi.workpiece_id=?",
+        (batch_id, workpiece_id),
     ).fetchone()
     rows = db.execute(
         "SELECT ts, metal_temp_c FROM readings WHERE batch_id=? AND workpiece_id=?"
@@ -76,9 +81,9 @@ def _cure_for_item(db, batch_id, workpiece_id):
     pts = [(datetime.fromisoformat(r["ts"]), r["metal_temp_c"]) for r in rows]
     return cure.evaluate(
         pts,
-        powder["temp_min_c"],
-        powder["temp_max_c"],
-        powder["hold_minutes"],
+        row["temp_min_c"],
+        row["temp_max_c"],
+        row["hold_minutes"],
         current_app.config["PROBE_GAP_MINUTES"],
     )
 
@@ -86,7 +91,11 @@ def _cure_for_item(db, batch_id, workpiece_id):
 def _batch_payload(db, b):
     items = db.execute(
         "SELECT bi.workpiece_id, bi.hanger_slot, bi.slots_used, w.order_id,"
-        " w.length_mm, w.width_mm, w.height_mm, w.weight_kg, w.powder_batch,"
+        " COALESCE(bi.snap_length_mm, w.length_mm) AS length_mm,"
+        " COALESCE(bi.snap_width_mm, w.width_mm) AS width_mm,"
+        " COALESCE(bi.snap_height_mm, w.height_mm) AS height_mm,"
+        " COALESCE(bi.snap_weight_kg, w.weight_kg) AS weight_kg,"
+        " COALESCE(bi.snap_powder_batch, w.powder_batch) AS powder_batch,"
         " w.compat_group, w.due_at, w.is_rework, w.status"
         " FROM batch_items bi JOIN workpieces w ON w.id = bi.workpiece_id"
         " WHERE bi.batch_id=? ORDER BY bi.hanger_slot",
@@ -220,6 +229,9 @@ def trial():
         powder_req.append(row)
 
     # 订单/工件 upsert（已存在的非待排产工件保持原状态，不会被重排）
+    # 未登记粉料的订单不入库，直接进 unscheduled 并给出 UNKNOWN_POWDER 原因
+    known_powders = {r["batch_no"] for r in db.execute("SELECT batch_no FROM powders")}
+    pre_unscheduled = []
     try:
         for o in data["orders"]:
             missing = [k for k in ("workpiece_id", "length_mm", "width_mm", "height_mm",
@@ -227,6 +239,13 @@ def trial():
             if missing:
                 return _err(400, f"订单缺少字段: {missing}"
                                  f" (workpiece_id={o.get('workpiece_id')})")
+            if o["powder_batch"] not in known_powders:
+                pre_unscheduled.append({
+                    "workpiece_id": o["workpiece_id"],
+                    "reason": scheduler.REASON_UNKNOWN_POWDER,
+                    "detail": f"粉料批号 {o['powder_batch']} 未登记",
+                })
+                continue
             due = _parse_dt(o["due_at"], "due_at").isoformat() if o.get("due_at") else None
             db.execute(
                 "INSERT INTO workpieces (id, order_id, length_mm, width_mm, height_mm,"
@@ -323,7 +342,7 @@ def trial():
                     "reason": data.get("reason", "")},
         "carried_batches": [dict(c) for c in carried],
         "new_batches": new_batches,
-        "unscheduled": unscheduled,
+        "unscheduled": pre_unscheduled + unscheduled,
     }), 201
 
 
@@ -338,6 +357,22 @@ def issue(bid):
         return _err(404, f"炉次 {bid} 不存在")
     if b["state"] not in TRANSITIONS["issue"][0]:
         return _err(409, f"炉次状态为 {b['state']}，不能签发（要求 DRAFT）", state=b["state"])
+    # 签发时快照工件尺寸/重量与粉料固化窗口，此后主数据变更不影响本炉次
+    rows = db.execute(
+        "SELECT bi.workpiece_id, w.length_mm, w.width_mm, w.height_mm, w.weight_kg,"
+        " w.powder_batch, p.temp_min_c, p.temp_max_c, p.hold_minutes"
+        " FROM batch_items bi"
+        " JOIN workpieces w ON w.id = bi.workpiece_id"
+        " LEFT JOIN powders p ON p.batch_no = w.powder_batch"
+        " WHERE bi.batch_id=?", (bid,)).fetchall()
+    for r in rows:
+        db.execute(
+            "UPDATE batch_items SET snap_length_mm=?, snap_width_mm=?, snap_height_mm=?,"
+            " snap_weight_kg=?, snap_powder_batch=?, snap_temp_min_c=?, snap_temp_max_c=?,"
+            " snap_hold_minutes=? WHERE batch_id=? AND workpiece_id=?",
+            (r["length_mm"], r["width_mm"], r["height_mm"], r["weight_kg"],
+             r["powder_batch"], r["temp_min_c"], r["temp_max_c"], r["hold_minutes"],
+             bid, r["workpiece_id"]))
     db.execute("UPDATE batches SET state='ISSUED' WHERE id=?", (bid,))
     db.commit()
     return jsonify({"batch_id": bid, "state": "ISSUED"})
@@ -385,6 +420,8 @@ def add_readings(bid):
         return _err(400, "缺少 readings（或单条 workpiece_id/ts/metal_temp_c）")
     valid = {r["workpiece_id"] for r in db.execute(
         "SELECT workpiece_id FROM batch_items WHERE batch_id=?", (bid,)).fetchall()}
+    load_at = (datetime.fromisoformat(b["actual_load_at"])
+               if b["actual_load_at"] else None)
     accepted, rejected = 0, []
     for e in entries:
         wid = e.get("workpiece_id")
@@ -396,6 +433,11 @@ def add_readings(bid):
             temp = float(e["metal_temp_c"])
         except (KeyError, TypeError, ValueError) as ex:
             rejected.append({"workpiece_id": wid, "reason": f"测温记录无效: {ex}"})
+            continue
+        if load_at is not None and ts < load_at:
+            rejected.append({"workpiece_id": wid,
+                             "reason": f"测温时刻早于实际入炉时刻 {b['actual_load_at']}，"
+                                       "不予采信"})
             continue
         db.execute(
             "INSERT INTO readings (batch_id, workpiece_id, ts, metal_temp_c)"

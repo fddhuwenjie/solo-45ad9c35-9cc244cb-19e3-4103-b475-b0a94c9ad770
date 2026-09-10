@@ -16,6 +16,9 @@ python3 run.py                    # 监听 127.0.0.1:5000，自动建库 instanc
 # 两组本地请求样例（另开终端执行）
 bash samples/scenario_a_normal.sh             # 正常闭环
 bash samples/scenario_b_conflicts_rework.sh   # 冲突/越序/返工/版本链
+
+# 回归测试（不依赖服务进程）
+python3 -m unittest discover -s tests -v
 ```
 
 重复运行样例前删除 `instance/ovenline.sqlite` 可获得干净数据。
@@ -45,11 +48,13 @@ samples/
 - 升温分钟 = (窗口中值 − 环境温度)/升温速率 + 装载公斤 × 热惯性系数；
 - 同炉次按工件交期先后串行衔接，已签发/在炉炉次占用炉膛的时间段自动避让；
 - 无法安排的工件进入 `unscheduled` 并给出具体原因：
-  `OVERSIZE`（尺寸超炉膛/挂位跨度）、`OVERWEIGHT`（超吊点承重）、`UNKNOWN_POWDER`。
+  `OVERSIZE`（尺寸超炉膛/挂位跨度）、`OVERWEIGHT`（超吊点承重）、
+  `UNKNOWN_POWDER`（粉料批号未登记；该订单不入库，登记粉料后重新提交即可排产）。
 
 ### 固化判定（出炉判定）
-按工件**自身粉料窗口**评估（窗口交集仅用于排产）：
+已签发炉次按**签发时快照**的工件尺寸与粉料窗口评估（草稿炉次按当前主数据）：
 - 相邻两个测温点都在窗口内，该区间时长才计入有效固化分钟（保守口径）；
+- 测温时刻早于实际入炉时刻的读数**拒收**，不落库、不计入有效保温；
 - 累计分钟 < 保温要求 → `UNDER_TIME` 欠时；
 - 任一测温点超过粉料上限 → `OVER_TEMP` 超温；
 - 相邻测温点间隔超过阈值（默认 10 分钟）→ `PROBE_GAP` 探头中断；
@@ -68,6 +73,8 @@ samples/
 ### 版本机制
 每次试算生成一个 `schedule_versions` 记录（`parent_id` 指向上版本，参数快照存档）：
 - **已签发/在炉炉次原样保留**（响应 `carried_batches`），其炉膛占用被新计划避让；
+- 签发时对炉内工件的尺寸、重量与粉料固化窗口做**快照**（`batch_items.snap_*`），
+  后续修改主数据或生成新版本，均不改变已签发炉次的查询结果与出炉判定；
 - 旧草稿作废（`SUPERSEDED`），待排产工件（含返工件）重新编排（`new_batches`）。
 
 ## API 一览（前缀 `/api`）

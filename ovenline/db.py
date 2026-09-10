@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS workpieces (
     width_mm     REAL NOT NULL,
     height_mm    REAL NOT NULL,
     weight_kg    REAL NOT NULL,
-    powder_batch TEXT NOT NULL REFERENCES powders(batch_no),
+    powder_batch TEXT NOT NULL,   -- 不建外键：未登记粉料的工件也要能入库并进入 unscheduled
     compat_group TEXT,            -- 禁配组标签；同炉禁配组两两不可同炉
     due_at       TEXT,            -- 交期 ISO 时间
     is_rework    INTEGER NOT NULL DEFAULT 0,
@@ -75,6 +75,15 @@ CREATE TABLE IF NOT EXISTS batch_items (
     workpiece_id TEXT NOT NULL REFERENCES workpieces(id),
     hanger_slot  INTEGER NOT NULL,   -- 起始挂位（1 起）
     slots_used   INTEGER NOT NULL,   -- 占用挂位数
+    -- 签发时快照：工件尺寸/重量与粉料固化窗口；签发后不再随主数据变化
+    snap_length_mm    REAL,
+    snap_width_mm     REAL,
+    snap_height_mm    REAL,
+    snap_weight_kg    REAL,
+    snap_powder_batch TEXT,
+    snap_temp_min_c   REAL,
+    snap_temp_max_c   REAL,
+    snap_hold_minutes REAL,
     PRIMARY KEY (batch_id, workpiece_id)
 );
 
@@ -115,6 +124,15 @@ def close_db(exc=None):
 def init_db():
     db = get_db()
     db.executescript(SCHEMA)
+    # 兼容旧库：为 batch_items 补齐签发快照列
+    existing = {r["name"] for r in db.execute("PRAGMA table_info(batch_items)")}
+    snapshot_cols = {"snap_length_mm": "REAL", "snap_width_mm": "REAL",
+                     "snap_height_mm": "REAL", "snap_weight_kg": "REAL",
+                     "snap_powder_batch": "TEXT", "snap_temp_min_c": "REAL",
+                     "snap_temp_max_c": "REAL", "snap_hold_minutes": "REAL"}
+    for col, typ in snapshot_cols.items():
+        if col not in existing:
+            db.execute(f"ALTER TABLE batch_items ADD COLUMN {col} {typ}")
     db.commit()
 
 
