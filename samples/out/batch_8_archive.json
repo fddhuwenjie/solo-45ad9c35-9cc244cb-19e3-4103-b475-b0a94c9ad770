@@ -1,0 +1,407 @@
+{
+  "batch_id": 8,
+  "version_id": 5,
+  "oven_id": "OVEN-1",
+  "state": "UNLOADED",
+  "window": {
+    "min_c": 170.0,
+    "max_c": 190.0,
+    "hold_minutes": 20.0
+  },
+  "total_weight_kg": 48.0,
+  "heatup_minutes": 39.71,
+  "planned": {
+    "load_at": "2026-09-10T10:12:54",
+    "cure_start_at": "2026-09-10T10:52:36",
+    "unload_at": "2026-09-10T11:12:36"
+  },
+  "actual": {
+    "load_at": "2026-09-10T08:00:00",
+    "unload_at": "2026-09-10T08:25:00"
+  },
+  "created_at": "2026-09-10T23:33:07",
+  "blackout_windows": [],
+  "blackout_wait_minutes": 0.0,
+  "schedule_basis": {
+    "baseline_load_at": "2026-09-10T10:12:54",
+    "baseline_unload_at": "2026-09-10T11:12:36",
+    "blackout_wait_minutes": 0.0,
+    "avoided_windows": [],
+    "earliest_due_at": "2026-09-10T16:00:00",
+    "lateness_minutes": 0.0,
+    "baseline_lateness_minutes": 0.0,
+    "lateness_delta_minutes": 0.0,
+    "turnaround_end_at": "2026-09-10T11:27:36"
+  },
+  "items": [
+    {
+      "workpiece_id": "THICK",
+      "hanger_slot": 1,
+      "slots_used": 3,
+      "order_id": "PO-D",
+      "length_mm": 1200.0,
+      "width_mm": 800.0,
+      "height_mm": 600.0,
+      "weight_kg": 40.0,
+      "powder_batch": "P-MIX",
+      "compat_group": null,
+      "due_at": "2026-09-10T16:00:00",
+      "is_rework": false,
+      "status": "REWORK_PENDING",
+      "actual_unload_at": "2026-09-10T08:25:00",
+      "unload_sequence": 2,
+      "first_met_at": null,
+      "final_verdict": "NOT_OK",
+      "force_reason": "后工序急件，线长确认放行返工",
+      "forced": true,
+      "cure": {
+        "reading_count": 3,
+        "in_window_minutes": 5.0,
+        "required_hold_minutes": 20.0,
+        "remaining_minutes": 15.0,
+        "under_time": true,
+        "over_temp": false,
+        "max_temp_c": 180.0,
+        "probe_gaps": [
+          {
+            "probe_id": null,
+            "from": "2026-09-10T08:00:00",
+            "to": "2026-09-10T08:15:00",
+            "minutes": 15.0
+          }
+        ],
+        "raw_reading_count": 3,
+        "judgment_series": [
+          {
+            "ts": "2026-09-10T08:00:00",
+            "temp_c": 25.0
+          },
+          {
+            "ts": "2026-09-10T08:15:00",
+            "temp_c": 179.0
+          },
+          {
+            "ts": "2026-09-10T08:20:00",
+            "temp_c": 180.0
+          }
+        ],
+        "probes": [
+          {
+            "probe_id": null,
+            "offset_c": 0.0,
+            "status": "ACTIVE",
+            "reading_count": 3,
+            "min_c": 25.0,
+            "max_c": 180.0,
+            "anomalies": [],
+            "disabled_reason": null,
+            "disabled_at": null
+          }
+        ],
+        "divergences": [],
+        "valid_probe_count": 1,
+        "min_valid_probes": 1,
+        "insufficient_probes": false
+      },
+      "flags": [
+        {
+          "code": "UNDER_TIME",
+          "detail": "许可区间累计 5.0 分钟，不足要求的 20.0 分钟",
+          "created_at": "2026-09-10T23:33:07"
+        },
+        {
+          "code": "PROBE_GAP",
+          "detail": "探头缺报: [{\"probe_id\": null, \"from\": \"2026-09-10T08:00:00\", \"to\": \"2026-09-10T08:15:00\", \"minutes\": 15.0}]",
+          "created_at": "2026-09-10T23:33:07"
+        }
+      ],
+      "probe_actions": [],
+      "progress_snapshot": {
+        "status": "TRACKING",
+        "status_text": "保温中，可预测",
+        "window": {
+          "min_c": 170.0,
+          "max_c": 190.0,
+          "hold_minutes": 20.0
+        },
+        "latest_reading_at": "2026-09-10T08:20:00",
+        "latest_temp_c": 180.0,
+        "reading_freshness_minutes": 5.0,
+        "stale": false,
+        "in_window_minutes": 5.0,
+        "remaining_hold_minutes": 15.0,
+        "valid_probe_count": 1,
+        "min_valid_probes": 1,
+        "first_met_at": null,
+        "safe_unload_at": "2026-09-10T08:35:00",
+        "blockers": [],
+        "alerts": [
+          {
+            "code": "PROBE_GAP",
+            "message": "存在 1 段探头缺报区间",
+            "intervals": [
+              {
+                "probe_id": null,
+                "from": "2026-09-10T08:00:00",
+                "to": "2026-09-10T08:15:00",
+                "minutes": 15.0
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "workpiece_id": "THIN",
+      "hanger_slot": 4,
+      "slots_used": 1,
+      "order_id": "PO-D",
+      "length_mm": 500.0,
+      "width_mm": 400.0,
+      "height_mm": 300.0,
+      "weight_kg": 8.0,
+      "powder_batch": "P-MIX",
+      "compat_group": null,
+      "due_at": "2026-09-10T16:00:00",
+      "is_rework": false,
+      "status": "DONE",
+      "actual_unload_at": "2026-09-10T08:25:00",
+      "unload_sequence": 1,
+      "first_met_at": "2026-09-10T08:25:00",
+      "final_verdict": "OK",
+      "force_reason": null,
+      "forced": false,
+      "cure": {
+        "reading_count": 6,
+        "in_window_minutes": 20.0,
+        "required_hold_minutes": 20.0,
+        "remaining_minutes": 0.0,
+        "under_time": false,
+        "over_temp": false,
+        "max_temp_c": 181.0,
+        "probe_gaps": [],
+        "raw_reading_count": 6,
+        "judgment_series": [
+          {
+            "ts": "2026-09-10T08:00:00",
+            "temp_c": 25.0
+          },
+          {
+            "ts": "2026-09-10T08:05:00",
+            "temp_c": 179.0
+          },
+          {
+            "ts": "2026-09-10T08:10:00",
+            "temp_c": 180.0
+          },
+          {
+            "ts": "2026-09-10T08:15:00",
+            "temp_c": 181.0
+          },
+          {
+            "ts": "2026-09-10T08:20:00",
+            "temp_c": 179.0
+          },
+          {
+            "ts": "2026-09-10T08:25:00",
+            "temp_c": 180.0
+          }
+        ],
+        "probes": [
+          {
+            "probe_id": null,
+            "offset_c": 0.0,
+            "status": "ACTIVE",
+            "reading_count": 6,
+            "min_c": 25.0,
+            "max_c": 181.0,
+            "anomalies": [],
+            "disabled_reason": null,
+            "disabled_at": null
+          }
+        ],
+        "divergences": [],
+        "valid_probe_count": 1,
+        "min_valid_probes": 1,
+        "insufficient_probes": false
+      },
+      "flags": [],
+      "probe_actions": [],
+      "progress_snapshot": {
+        "status": "MET",
+        "status_text": "已达标",
+        "window": {
+          "min_c": 170.0,
+          "max_c": 190.0,
+          "hold_minutes": 20.0
+        },
+        "latest_reading_at": "2026-09-10T08:25:00",
+        "latest_temp_c": 180.0,
+        "reading_freshness_minutes": 0.0,
+        "stale": false,
+        "in_window_minutes": 20.0,
+        "remaining_hold_minutes": 0.0,
+        "valid_probe_count": 1,
+        "min_valid_probes": 1,
+        "first_met_at": "2026-09-10T08:25:00",
+        "safe_unload_at": "2026-09-10T08:25:00",
+        "blockers": [],
+        "alerts": []
+      }
+    }
+  ],
+  "unload_order": [
+    {
+      "sequence": 1,
+      "workpiece_id": "THIN",
+      "unload_at": "2026-09-10T08:25:00",
+      "verdict": "OK",
+      "forced": false,
+      "reason": null,
+      "flags": [],
+      "progress_snapshot": {
+        "status": "MET",
+        "status_text": "已达标",
+        "window": {
+          "min_c": 170.0,
+          "max_c": 190.0,
+          "hold_minutes": 20.0
+        },
+        "latest_reading_at": "2026-09-10T08:25:00",
+        "latest_temp_c": 180.0,
+        "reading_freshness_minutes": 0.0,
+        "stale": false,
+        "in_window_minutes": 20.0,
+        "remaining_hold_minutes": 0.0,
+        "valid_probe_count": 1,
+        "min_valid_probes": 1,
+        "first_met_at": "2026-09-10T08:25:00",
+        "safe_unload_at": "2026-09-10T08:25:00",
+        "blockers": [],
+        "alerts": []
+      }
+    },
+    {
+      "sequence": 2,
+      "workpiece_id": "THICK",
+      "unload_at": "2026-09-10T08:25:00",
+      "verdict": "NOT_OK",
+      "forced": true,
+      "reason": "后工序急件，线长确认放行返工",
+      "flags": [
+        "UNDER_TIME",
+        "PROBE_GAP"
+      ],
+      "progress_snapshot": {
+        "status": "TRACKING",
+        "status_text": "保温中，可预测",
+        "window": {
+          "min_c": 170.0,
+          "max_c": 190.0,
+          "hold_minutes": 20.0
+        },
+        "latest_reading_at": "2026-09-10T08:20:00",
+        "latest_temp_c": 180.0,
+        "reading_freshness_minutes": 5.0,
+        "stale": false,
+        "in_window_minutes": 5.0,
+        "remaining_hold_minutes": 15.0,
+        "valid_probe_count": 1,
+        "min_valid_probes": 1,
+        "first_met_at": null,
+        "safe_unload_at": "2026-09-10T08:35:00",
+        "blockers": [],
+        "alerts": [
+          {
+            "code": "PROBE_GAP",
+            "message": "存在 1 段探头缺报区间",
+            "intervals": [
+              {
+                "probe_id": null,
+                "from": "2026-09-10T08:00:00",
+                "to": "2026-09-10T08:15:00",
+                "minutes": 15.0
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "progress": {
+    "basis": {
+      "as_of": "2026-09-10T08:25:00",
+      "source": "actual_unload_at",
+      "computed_at": "2026-09-10T23:33:07"
+    },
+    "prediction_status": "PREDICTABLE",
+    "prediction_status_text": "可预测",
+    "met_count": 1,
+    "tracking_count": 1,
+    "blocked_count": 0,
+    "safe_unload_at": "2026-09-10T08:35:00",
+    "planned_unload_at": "2026-09-10T11:12:36",
+    "plan_status": "OK",
+    "planned_unload_early_minutes": 0.0,
+    "items": [
+      {
+        "status": "MET",
+        "status_text": "已达标",
+        "window": {
+          "min_c": 170.0,
+          "max_c": 190.0,
+          "hold_minutes": 20.0
+        },
+        "latest_reading_at": "2026-09-10T08:25:00",
+        "latest_temp_c": 180.0,
+        "reading_freshness_minutes": 0.0,
+        "stale": false,
+        "in_window_minutes": 20.0,
+        "remaining_hold_minutes": 0.0,
+        "valid_probe_count": 1,
+        "min_valid_probes": 1,
+        "first_met_at": "2026-09-10T08:25:00",
+        "safe_unload_at": "2026-09-10T08:25:00",
+        "blockers": [],
+        "alerts": [],
+        "workpiece_id": "THIN"
+      },
+      {
+        "status": "TRACKING",
+        "status_text": "保温中，可预测",
+        "window": {
+          "min_c": 170.0,
+          "max_c": 190.0,
+          "hold_minutes": 20.0
+        },
+        "latest_reading_at": "2026-09-10T08:20:00",
+        "latest_temp_c": 180.0,
+        "reading_freshness_minutes": 5.0,
+        "stale": false,
+        "in_window_minutes": 5.0,
+        "remaining_hold_minutes": 15.0,
+        "valid_probe_count": 1,
+        "min_valid_probes": 1,
+        "first_met_at": null,
+        "safe_unload_at": "2026-09-10T08:35:00",
+        "blockers": [],
+        "alerts": [
+          {
+            "code": "PROBE_GAP",
+            "message": "存在 1 段探头缺报区间",
+            "intervals": [
+              {
+                "probe_id": null,
+                "from": "2026-09-10T08:00:00",
+                "to": "2026-09-10T08:15:00",
+                "minutes": 15.0
+              }
+            ]
+          }
+        ],
+        "workpiece_id": "THICK"
+      }
+    ]
+  },
+  "exported_at": "2026-09-10T23:33:07"
+}

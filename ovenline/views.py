@@ -35,6 +35,10 @@ FLAG_INSUFFICIENT_PROBES = "INSUFFICIENT_PROBES"  # 有效探头数不足，不�
 FLAG_UNISSUED_UNLOAD = "UNISSUED_UNLOAD"    # 未签发出炉
 FLAG_INCOMPAT = "INCOMPAT_CONFLICT"         # 禁配冲突
 
+# 停机窗类型（清炉/校准/检修整段占用烘炉）
+BLACKOUT_KINDS = {"CLEANING": "清炉", "CALIBRATION": "校准", "MAINTENANCE": "检修"}
+_KIND_ALIASES = {v: k for k, v in BLACKOUT_KINDS.items()}
+
 
 # ---------------------------------------------------------------- 工具
 
@@ -475,6 +479,16 @@ def _batch_payload(db, b, as_of=None, as_of_source=None):
         progress_snapshot = _frozen_progress(db, b)
     else:
         progress_snapshot = _batch_progress(db, b, resolved_as_of, basis_source)
+    # 本炉次所属版本、本炉的停机窗（清炉/校准/检修）与排产计算依据
+    blackouts = [
+        {"oven_id": r["oven_id"], "kind": r["kind"],
+         "kind_text": BLACKOUT_KINDS.get(r["kind"], r["kind"]),
+         "start_at": r["start_at"], "end_at": r["end_at"], "note": r["note"]}
+        for r in db.execute(
+            "SELECT oven_id, kind, start_at, end_at, note FROM blackout_windows"
+            " WHERE version_id=? AND oven_id=? ORDER BY start_at",
+            (b["version_id"], b["oven_id"])).fetchall()
+    ]
     # 逐件离炉顺序（序号、时刻、判定、强制原因、当时进度快照）
     unload_order = [
         {"sequence": a["sequence"], "workpiece_id": a["workpiece_id"],
@@ -506,11 +520,163 @@ def _batch_payload(db, b, as_of=None, as_of_source=None):
         },
         "actual": {"load_at": b["actual_load_at"], "unload_at": b["actual_unload_at"]},
         "created_at": b["created_at"],
+        # 停机避让：关联停机窗与排产计算依据（未避让基准时刻/等待分钟/逾期变化）
+        "blackout_windows": blackouts,
+        "blackout_wait_minutes": b["blackout_wait_minutes"],
+        "schedule_basis": (json.loads(b["schedule_basis_json"])
+                           if b["schedule_basis_json"] else None),
         "items": out_items,
         "unload_order": unload_order,
         # 同一进度快照贯穿炉次详情 / JSON 档案 / 随炉卡
         "progress": progress_snapshot,
     }
+
+
+# ---------------------------------------------------------------- 停机窗
+
+def _parse_blackouts(raw_list, oven_ids):
+    """校验并规范化停机窗：未知炉号 / 起止倒序 / 同炉重叠一律拒绝（ValueError）。
+
+    返回 [{oven_id, kind, start_at, end_at, note}]，start_at/end_at 为 datetime。
+    """
+    if raw_list is None:
+        return []
+    if not isinstance(raw_list, list):
+        raise ValueError("blackout_windows 须为数组，元素含"
+                         " oven_id/kind/start_at/end_at/note")
+    windows = []
+    for w in raw_list:
+        if not isinstance(w, dict):
+            raise ValueError(f"停机窗须为对象: {w!r}")
+        missing = [k for k in ("oven_id", "kind", "start_at", "end_at") if k not in w]
+        if missing:
+            raise ValueError(f"停机窗缺少字段: {missing}")
+        oid = w["oven_id"]
+        if oid not in oven_ids:
+            raise ValueError(f"停机窗引用未知炉号: {oid!r}（本次试算未包含该炉）")
+        kind = _KIND_ALIASES.get(str(w["kind"]).strip(),
+                                 str(w["kind"]).strip().upper())
+        if kind not in BLACKOUT_KINDS:
+            raise ValueError(
+                f"未知停机类型: {w['kind']!r}（支持 清炉/校准/检修，"
+                "即 CLEANING/CALIBRATION/MAINTENANCE）")
+        start = _parse_dt(w["start_at"], "blackout_windows.start_at")
+        end = _parse_dt(w["end_at"], "blackout_windows.end_at")
+        if end <= start:
+            raise ValueError(
+                f"炉 {oid} 停机窗起止倒序: {start.isoformat()} 不早于 "
+                f"{end.isoformat()}")
+        windows.append({"oven_id": oid, "kind": kind, "start_at": start,
+                        "end_at": end, "note": w.get("note")})
+    by_oven = {}
+    for w in windows:
+        by_oven.setdefault(w["oven_id"], []).append(w)
+    for oid, ws in by_oven.items():
+        ws.sort(key=lambda x: x["start_at"])
+        for a, b in zip(ws, ws[1:]):
+            if b["start_at"] < a["end_at"]:
+                raise ValueError(
+                    f"炉 {oid} 停机窗重叠: "
+                    f"{a['start_at'].isoformat()}–{a['end_at'].isoformat()} 与 "
+                    f"{b['start_at'].isoformat()}–{b['end_at'].isoformat()}")
+    return windows
+
+
+def _window_json(w):
+    return {"oven_id": w["oven_id"], "kind": w["kind"],
+            "kind_text": BLACKOUT_KINDS[w["kind"]],
+            "start_at": w["start_at"].isoformat(timespec="seconds"),
+            "end_at": w["end_at"].isoformat(timespec="seconds"),
+            "note": w.get("note")}
+
+
+def _blackout_conflicts(carried, windows_by_oven, turnaround_by_oven):
+    """新停机窗与已签发/在炉炉次占用区间的重叠清单（这些炉次不得改时刻）。
+
+    占用区间 = [计划入炉, 计划出炉+周转]；每处重叠给出区间与冲突分钟。
+    """
+    conflicts = []
+    for c in carried:
+        load = _parse_dt(c["planned_load_at"], "planned_load_at")
+        unload = _parse_dt(c["planned_unload_at"], "planned_unload_at")
+        occ_end = unload + timedelta(
+            minutes=turnaround_by_oven.get(c["oven_id"], 0))
+        for w in windows_by_oven.get(c["oven_id"], []):
+            s = max(load, w["start_at"])
+            e = min(occ_end, w["end_at"])
+            if s < e:
+                conflicts.append({
+                    "oven_id": c["oven_id"],
+                    "batch_id": c["id"],
+                    "batch_state": c["state"],
+                    "occupied": {
+                        "start_at": load.isoformat(timespec="seconds"),
+                        "end_at": occ_end.isoformat(timespec="seconds"),
+                    },
+                    "blackout": _window_json(w),
+                    "overlap": {
+                        "start_at": s.isoformat(timespec="seconds"),
+                        "end_at": e.isoformat(timespec="seconds"),
+                        "minutes": round((e - s).total_seconds() / 60.0, 2),
+                    },
+                })
+    return conflicts
+
+
+def _oven_timelines(oven_rows, carried, new_batches, windows_by_oven):
+    """逐炉时间线：区分生产占用 / 周转 / 停机，并比较各炉完工时刻与交期。
+
+    carried:     已签发/在炉炉次行（id, oven_id, state, 计划起止）
+    new_batches: 本次试算新排炉次 dict（含 turnaround_end_at 与逾期字段）
+    """
+    timelines = []
+    for ov in oven_rows:
+        oid = ov["id"]
+        turnaround = float(ov["turnaround_minutes"])
+        segments = []
+        for c in carried:
+            if c["oven_id"] != oid:
+                continue
+            unload = _parse_dt(c["planned_unload_at"], "planned_unload_at")
+            segments.append({
+                "kind": "PRODUCTION", "batch_id": c["id"], "state": c["state"],
+                "start_at": c["planned_load_at"], "end_at": c["planned_unload_at"]})
+            segments.append({
+                "kind": "TURNAROUND", "batch_id": c["id"], "state": c["state"],
+                "start_at": c["planned_unload_at"],
+                "end_at": (unload + timedelta(minutes=turnaround))
+                .isoformat(timespec="seconds")})
+        for b in new_batches:
+            if b["oven_id"] != oid:
+                continue
+            segments.append({
+                "kind": "PRODUCTION", "batch_id": b["batch_id"], "state": "DRAFT",
+                "start_at": b["planned_load_at"], "end_at": b["planned_unload_at"]})
+            segments.append({
+                "kind": "TURNAROUND", "batch_id": b["batch_id"], "state": "DRAFT",
+                "start_at": b["planned_unload_at"],
+                "end_at": b["turnaround_end_at"]})
+        for w in windows_by_oven.get(oid, []):
+            wj = _window_json(w)
+            segments.append({
+                "kind": "BLACKOUT", "blackout_kind": wj["kind"],
+                "kind_text": wj["kind_text"], "start_at": wj["start_at"],
+                "end_at": wj["end_at"], "note": wj["note"]})
+        segments.sort(key=lambda s: (s["start_at"], s["kind"]))
+        ends = [s["end_at"] for s in segments if s["kind"] == "PRODUCTION"]
+        releases = [s["end_at"] for s in segments if s["kind"] == "TURNAROUND"]
+        late = [b["lateness_minutes"] for b in new_batches
+                if b["oven_id"] == oid and b["lateness_minutes"] > 0]
+        timelines.append({
+            "oven_id": oid,
+            "segments": segments,
+            # 完工时刻 = 最后一炉出炉；释放时刻 = 完工+周转后炉膛可再次排产
+            "completed_at": max(ends) if ends else None,
+            "released_at": max(releases) if releases else None,
+            "late_batches": len(late),
+            "max_lateness_minutes": round(max(late), 2) if late else 0.0,
+        })
+    return timelines
 
 
 # ---------------------------------------------------------------- 试算
@@ -578,6 +744,16 @@ def trial():
             row,
         )
         oven_rows.append(row)
+
+    # 停机窗（清炉/校准/检修）：整段占用烘炉；未知炉号/倒序/同炉重叠一律拒绝
+    try:
+        blackouts = _parse_blackouts(data.get("blackout_windows", []),
+                                     {ov["id"] for ov in oven_rows})
+    except ValueError as e:
+        return _err(400, str(e))
+    windows_by_oven = {}
+    for w in blackouts:
+        windows_by_oven.setdefault(w["oven_id"], []).append(w)
 
     # 粉料主数据 upsert
     powder_req = []
@@ -653,6 +829,8 @@ def trial():
         "forbidden_pairs": sorted(list(p) for p in forbidden),
         "ovens": oven_rows,
         "powders": powder_req,
+        # 停机窗随版本快照存档，后续试算可整体改写
+        "blackout_windows": [_window_json(w) for w in blackouts],
     }
     cur = db.execute(
         "INSERT INTO schedule_versions (parent_id, reason, params_json, created_at)"
@@ -661,6 +839,15 @@ def trial():
          json.dumps(snapshot, ensure_ascii=False), _now().isoformat()),
     )
     version_id = cur.lastrowid
+    for w in blackouts:
+        db.execute(
+            "INSERT INTO blackout_windows (version_id, oven_id, kind, start_at,"
+            " end_at, note, created_at) VALUES (?,?,?,?,?,?,?)",
+            (version_id, w["oven_id"], w["kind"],
+             w["start_at"].isoformat(timespec="seconds"),
+             w["end_at"].isoformat(timespec="seconds"),
+             w.get("note"), _now().isoformat()),
+    )
 
     # 已签发/在炉炉次占用炉膛到计划出炉+周转，编排时避让
     busy_until = {}
@@ -683,18 +870,27 @@ def trial():
         "SELECT * FROM workpieces WHERE status='PENDING' ORDER BY id").fetchall()
         if r["id"] not in rejected_ids]
     planned, unscheduled = scheduler.build_plan(
-        pending, powder_all, oven_rows, forbidden, start_at, busy_until)
+        pending, powder_all, oven_rows, forbidden, start_at, busy_until,
+        blackouts=windows_by_oven)
 
     new_batches = []
     for b in planned:
+        # 停机避让计算依据随炉次冻结，炉次详情/档案据此复算
+        basis = {k: b[k] for k in (
+            "baseline_load_at", "baseline_unload_at", "blackout_wait_minutes",
+            "avoided_windows", "earliest_due_at", "lateness_minutes",
+            "baseline_lateness_minutes", "lateness_delta_minutes",
+            "turnaround_end_at")}
         cur = db.execute(
             "INSERT INTO batches (version_id, oven_id, state, window_min_c, window_max_c,"
             " hold_minutes, total_weight_kg, heatup_minutes, planned_load_at,"
-            " planned_cure_start_at, planned_unload_at, created_at)"
-            " VALUES (?,?,'DRAFT',?,?,?,?,?,?,?,?,?)",
+            " planned_cure_start_at, planned_unload_at, blackout_wait_minutes,"
+            " schedule_basis_json, created_at)"
+            " VALUES (?,?,'DRAFT',?,?,?,?,?,?,?,?,?,?,?)",
             (version_id, b["oven_id"], b["window_min_c"], b["window_max_c"],
              b["hold_minutes"], b["total_weight_kg"], b["heatup_minutes"],
              b["planned_load_at"], b["planned_cure_start_at"], b["planned_unload_at"],
+             b["blackout_wait_minutes"], json.dumps(basis, ensure_ascii=False),
              _now().isoformat()),
         )
         bid = cur.lastrowid
@@ -712,12 +908,20 @@ def trial():
     carried = db.execute(
         "SELECT id, oven_id, state, planned_load_at, planned_unload_at FROM batches"
         " WHERE state IN ('ISSUED','IN_OVEN') ORDER BY id").fetchall()
+    # 新停机窗撞上已签发/在炉炉次：这些炉次不得改时刻，列出重叠区间与冲突分钟
+    turnaround_by_oven = {ov["id"]: float(ov["turnaround_minutes"])
+                          for ov in oven_rows}
+    conflicts = _blackout_conflicts(carried, windows_by_oven, turnaround_by_oven)
     return jsonify({
         "version": {"id": version_id, "parent_id": parent["id"] if parent else None,
                     "reason": data.get("reason", "")},
         "carried_batches": [dict(c) for c in carried],
         "new_batches": new_batches,
         "unscheduled": pre_unscheduled + unscheduled,
+        "blackout_windows": [_window_json(w) for w in blackouts],
+        "blackout_conflicts": conflicts,
+        "oven_timelines": _oven_timelines(oven_rows, carried, new_batches,
+                                          windows_by_oven),
     }), 201
 
 
@@ -1293,9 +1497,46 @@ def list_versions():
     db = get_db()
     rows = db.execute(
         "SELECT v.id, v.parent_id, v.reason, v.created_at,"
-        " (SELECT COUNT(*) FROM batches b WHERE b.version_id = v.id) AS batch_count"
+        " (SELECT COUNT(*) FROM batches b WHERE b.version_id = v.id) AS batch_count,"
+        " (SELECT COUNT(*) FROM blackout_windows w WHERE w.version_id = v.id)"
+        "   AS blackout_count"
         " FROM schedule_versions v ORDER BY v.id").fetchall()
     return jsonify({"versions": [dict(r) for r in rows]})
+
+
+@bp.get("/versions/<int:vid>")
+def version_detail(vid):
+    """排产版本详情：参数快照（含停机窗）与该版本排出的炉次。"""
+    db = get_db()
+    v = db.execute("SELECT * FROM schedule_versions WHERE id=?", (vid,)).fetchone()
+    if v is None:
+        return _err(404, f"排产版本 {vid} 不存在")
+    params = json.loads(v["params_json"]) if v["params_json"] else {}
+    windows = [
+        {"oven_id": r["oven_id"], "kind": r["kind"],
+         "kind_text": BLACKOUT_KINDS.get(r["kind"], r["kind"]),
+         "start_at": r["start_at"], "end_at": r["end_at"], "note": r["note"]}
+        for r in db.execute(
+            "SELECT oven_id, kind, start_at, end_at, note FROM blackout_windows"
+            " WHERE version_id=? ORDER BY oven_id, start_at", (vid,)).fetchall()
+    ]
+    batches = [
+        {"batch_id": r["id"], "oven_id": r["oven_id"], "state": r["state"],
+         "planned_load_at": r["planned_load_at"],
+         "planned_unload_at": r["planned_unload_at"],
+         "blackout_wait_minutes": r["blackout_wait_minutes"]}
+        for r in db.execute(
+            "SELECT id, oven_id, state, planned_load_at, planned_unload_at,"
+            " blackout_wait_minutes FROM batches WHERE version_id=? ORDER BY id",
+            (vid,)).fetchall()
+    ]
+    return jsonify({
+        "id": v["id"], "parent_id": v["parent_id"], "reason": v["reason"],
+        "created_at": v["created_at"],
+        "params": params,                # 试算输入快照（计算依据）
+        "blackout_windows": windows,     # 该版本登记的停机窗
+        "batches": batches,
+    })
 
 
 @bp.get("/batches/<int:bid>/archive")
@@ -1437,7 +1678,7 @@ def batch_card(bid):
         )
     plan_text = {
         "OK": "计划出炉时刻不早于预测安全出炉时刻，计划有效",
-        "TOO_EARLY": f"计划出炉过早 {prog.get('planned_unload_early_minutes', 0):g} 分钟，"
+        "TOO_EARLY": f"计划出炉过早 {prog.get('planned_unload_early_minutes') or 0:g} 分钟，"
                      "计划出炉时刻已失效，应按预测安全出炉时刻延后",
         "CANNOT_VERIFY": "存在不可预测工件，无法判定计划出炉时刻是否有效",
     }.get(prog.get("plan_status"), "-")

@@ -6,7 +6,9 @@
 - 工件按尺寸与重量折算占用挂位数（相邻挂位），不得超过炉内挂位总数；
 - 保温时长取同炉各粉料要求的最大值；
 - 升温时间 = (目标温度 - 环境温度) / 升温速率 + 装载重量 × 热惯性系数；
-- 同炉目标温度取窗口中值；炉次按工件交期先后串行衔接。
+- 同炉目标温度取窗口中值；炉次按工件交期先后串行衔接；
+- 装载、升温、保温及周转是一个不可拆分的占用区间，与停机窗
+  （清炉/校准/检修）相交时整体移到该停机窗结束之后，再比较完工时刻与交期。
 """
 from __future__ import annotations
 
@@ -89,7 +91,33 @@ class _Batch:
             self.groups.add(wp["compat_group"])
 
 
-def build_plan(workpieces, powders, ovens, forbidden_pairs, start_at, busy_until=None):
+def _shift_past_blackouts(load_at, block_minutes, windows):
+    """不可拆分占用区间 [load_at, load_at+block) 撞上停机窗时整体后移。
+
+    windows: [{"start_at", "end_at", ...}]，须按开始时刻升序且互不重叠；
+    区间与某窗相交即把装载时刻推迟到该窗结束，后续窗口继续检查
+    （窗口互不重叠，单趟扫描即可）。返回 (避让后装载时刻, 被避让的窗口列表)。
+    """
+    avoided = []
+    for w in windows:
+        block_end = load_at + timedelta(minutes=block_minutes)
+        if load_at < w["end_at"] and block_end > w["start_at"]:
+            avoided.append(w)
+            load_at = w["end_at"]
+    return load_at, avoided
+
+
+def _lateness(unload_at, dues):
+    """炉次逾期分钟：出炉时刻相对炉内最早交期的超出量（无交期为 0）。"""
+    if not dues:
+        return 0.0, None
+    earliest = min(datetime.fromisoformat(d) for d in dues)
+    late = max(0.0, (unload_at - earliest).total_seconds() / 60.0)
+    return late, min(dues)
+
+
+def build_plan(workpieces, powders, ovens, forbidden_pairs, start_at, busy_until=None,
+               blackouts=None):
     """编排炉次。
 
     workpieces:      待排产工件 dict 列表（含 powder_batch / compat_group / due_at）
@@ -98,10 +126,13 @@ def build_plan(workpieces, powders, ovens, forbidden_pairs, start_at, busy_until
     forbidden_pairs: {(组A, 组B)} 同炉禁配组
     start_at:        排产起点 datetime
     busy_until:      {炉号: datetime} 已签发/在炉炉次占用到的时刻
+    blackouts:       {炉号: [{"start_at", "end_at", "kind", "note"}]} 停机窗
+                     （清炉/校准/检修），整段占用区间须避让
 
     返回 (planned_batches, unscheduled)
     """
     busy_until = busy_until or {}
+    blackouts = blackouts or {}
     unscheduled = []
     plannable = []
 
@@ -149,7 +180,7 @@ def build_plan(workpieces, powders, ovens, forbidden_pairs, start_at, busy_until
             b.add(wp, powder)
             open_batches.append(b)
 
-    # 计时：每台炉的炉次按最早交期排序，串行衔接
+    # 计时：每台炉的炉次按最早交期排序，串行衔接；停机窗整段避让
     planned = []
     for ov in ovens:
         obs = [b for b in open_batches if b.oven is ov]
@@ -159,16 +190,26 @@ def build_plan(workpieces, powders, ovens, forbidden_pairs, start_at, busy_until
             return (not dues, min(dues) if dues else "")
 
         obs.sort(key=batch_due)
+        windows = sorted(blackouts.get(ov["id"], []),
+                         key=lambda w: w["start_at"])
         available = max(start_at, busy_until.get(ov["id"], start_at))
         for b in obs:
             target = (b.window_min + b.window_max) / 2.0
             heatup = max(0.0, (target - ov["ambient_c"]) / ov["heat_rate_c_per_min"]) \
                 + b.weight * ov["mass_factor_min_per_kg"]
-            load_at = available
+            # 装载→升温→保温→周转不可拆分：整段撞上停机窗则整体移到窗后
+            block = heatup + b.hold + ov["turnaround_minutes"]
+            baseline_load = available
+            load_at, avoided = _shift_past_blackouts(baseline_load, block, windows)
+            wait_min = (load_at - baseline_load).total_seconds() / 60.0
             cure_start = load_at + timedelta(minutes=heatup)
             unload_at = cure_start + timedelta(minutes=b.hold)
+            baseline_unload = baseline_load + timedelta(minutes=heatup + b.hold)
             available = unload_at + timedelta(minutes=ov["turnaround_minutes"])
             unload_iso = unload_at.isoformat(timespec="seconds")
+            dues = [i["wp"]["due_at"] for i in b.items if i["wp"].get("due_at")]
+            lateness, earliest_due = _lateness(unload_at, dues)
+            base_lateness, _ = _lateness(baseline_unload, dues)
             planned.append({
                 "oven_id": ov["id"],
                 "window_min_c": b.window_min,
@@ -179,6 +220,22 @@ def build_plan(workpieces, powders, ovens, forbidden_pairs, start_at, busy_until
                 "planned_load_at": load_at.isoformat(timespec="seconds"),
                 "planned_cure_start_at": cure_start.isoformat(timespec="seconds"),
                 "planned_unload_at": unload_iso,
+                "turnaround_end_at": available.isoformat(timespec="seconds"),
+                # 停机避让计算依据：未避让的基准时刻、避让窗口与增加的等待分钟
+                "baseline_load_at": baseline_load.isoformat(timespec="seconds"),
+                "baseline_unload_at": baseline_unload.isoformat(timespec="seconds"),
+                "blackout_wait_minutes": round(wait_min, 2),
+                "avoided_windows": [{
+                    "kind": w["kind"],
+                    "start_at": w["start_at"].isoformat(timespec="seconds"),
+                    "end_at": w["end_at"].isoformat(timespec="seconds"),
+                    "note": w.get("note"),
+                } for w in avoided],
+                # 逾期：出炉时刻相对炉内最早交期；delta 为避让引起的逾期变化
+                "earliest_due_at": earliest_due,
+                "lateness_minutes": round(lateness, 2),
+                "baseline_lateness_minutes": round(base_lateness, 2),
+                "lateness_delta_minutes": round(lateness - base_lateness, 2),
                 "items": [{
                     "workpiece_id": i["wp"]["id"],
                     "order_id": i["wp"].get("order_id"),

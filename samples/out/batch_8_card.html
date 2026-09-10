@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>随炉卡 · 炉次 8</title>
+<style>
+body { font-family: "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; margin: 24px; }
+h1 { font-size: 20px; margin-bottom: 4px; }
+h2 { font-size: 16px; margin: 20px 0 4px; }
+h3 { font-size: 14px; margin: 12px 0 4px; }
+table { border-collapse: collapse; width: 100%; margin-top: 12px; }
+td, th { border: 1px solid #333; padding: 4px 8px; font-size: 13px; }
+table.meta td { border: none; padding: 2px 16px 2px 0; }
+p.small { font-size: 12px; margin: 4px 0; }
+.sign { margin-top: 36px; display: flex; gap: 64px; font-size: 14px; }
+@media print { button { display: none; } }
+</style></head><body>
+<button onclick="window.print()">打印</button>
+<h1>粉末固化随炉卡 · 炉次 #8</h1>
+<table class="meta">
+<tr><td>炉号：OVEN-1</td><td>状态：UNLOADED</td>
+    <td>排产版本：v5</td><td>总重：48.0 kg</td></tr>
+<tr><td>固化窗口：170.0–190.0 ℃</td>
+    <td>保温：20.0 min</td>
+    <td>升温：39.71 min</td><td></td></tr>
+<tr><td>计划入炉：2026-09-10T10:12:54</td>
+    <td>固化开始：2026-09-10T10:52:36</td>
+    <td>计划出炉：2026-09-10T11:12:36</td><td></td></tr>
+<tr><td>实际入炉：2026-09-10T08:00:00</td>
+    <td>实际出炉：2026-09-10T08:25:00</td><td></td><td></td></tr>
+</table>
+<table>
+<tr><th>工件</th><th>订单</th><th>粉料</th><th>尺寸 mm</th><th>重量 kg</th>
+    <th>挂位</th><th>交期</th><th>在区/要求 min</th><th>离炉（顺序/时刻/判定）</th><th>标记</th></tr>
+<tr><td>THICK</td><td>PO-D</td><td>P-MIX</td><td>1200×800×600</td><td>40.0</td><td>1–3</td><td>2026-09-10T16:00:00</td><td>5.0 / 20</td><td>#2 09-10T08:25 不合格（强制）</td><td>UNDER_TIME、PROBE_GAP</td></tr><tr><td>THIN</td><td>PO-D</td><td>P-MIX</td><td>500×400×300</td><td>8.0</td><td>4–4</td><td>2026-09-10T16:00:00</td><td>20.0 / 20</td><td>#1 09-10T08:25 合格</td><td>-</td></tr>
+</table>
+<h2>在炉固化进度与安全出炉预测</h2>
+<table class="meta">
+<tr><td>计算基准时刻：2026-09-10T08:25:00（实际出炉时刻）</td>
+    <td>预测状态：可预测
+        （PREDICTABLE）</td></tr>
+<tr><td>预测安全出炉：2026-09-10T08:35:00</td>
+    <td>计划出炉：2026-09-10T11:12:36</td></tr>
+<tr><td colspan="2">计划校验：计划出炉时刻不早于预测安全出炉时刻，计划有效</td></tr>
+</table>
+<table>
+<tr><th>工件</th><th>状态</th><th>最新测温</th><th>最新最低校正 ℃</th>
+    <th>读数新鲜度</th><th>累计/要求 min</th><th>剩余 min</th>
+    <th>首次达标</th><th>预测安全出炉</th><th>阻塞原因</th><th>告警</th></tr>
+<tr><td>THIN</td><td>已达标（MET）</td><td>2026-09-10T08:25:00</td><td>180</td><td>0 分钟</td><td>20 / 20</td><td>0</td><td>2026-09-10T08:25:00</td><td>2026-09-10T08:25:00</td><td>-</td><td>-</td></tr><tr><td>THICK</td><td>保温中，可预测（TRACKING）</td><td>2026-09-10T08:20:00</td><td>180</td><td>5 分钟</td><td>5 / 20</td><td>15</td><td>-</td><td>2026-09-10T08:35:00</td><td>-</td><td>[PROBE_GAP] 存在 1 段探头缺报区间</td></tr>
+</table>
+<h2>探头与判定序列</h2>
+<h3>工件 THICK（有效探头 1 / 要求 1）</h3><table><tr><th>探头</th><th>校准偏移 ℃</th><th>状态</th><th>读数</th><th>异常区间</th></tr><tr><td>（隐式通道）</td><td>+0.00</td><td>ACTIVE</td><td>3</td><td>-</td></tr></table><p class='small'>探头温差异常：-</p><p class='small'>缺报区间：（隐式通道） 2026-09-10T08:00:00–2026-09-10T08:15:00（15.0 分钟）</p><p class='small'>判定序列（各时刻有效探头最低校正温度）：08:00=25.0，08:15=179.0，08:20=180.0</p><h3>工件 THIN（有效探头 1 / 要求 1）</h3><table><tr><th>探头</th><th>校准偏移 ℃</th><th>状态</th><th>读数</th><th>异常区间</th></tr><tr><td>（隐式通道）</td><td>+0.00</td><td>ACTIVE</td><td>6</td><td>-</td></tr></table><p class='small'>探头温差异常：-</p><p class='small'>缺报区间：-</p><p class='small'>判定序列（各时刻有效探头最低校正温度）：08:00=25.0，08:05=179.0，08:10=180.0，08:15=181.0，08:20=179.0，08:25=180.0</p>
+<h2>逐件离炉记录</h2><table><tr><th>顺序</th><th>工件</th><th>离炉时刻</th><th>最终判定</th><th>强制原因</th><th>首次达标</th><th>离炉时累计/要求 min</th><th>剩余 min</th><th>标记</th></tr><tr><td>1</td><td>THIN</td><td>2026-09-10T08:25:00</td><td>合格</td><td>-</td><td>2026-09-10T08:25:00</td><td>20 / 20</td><td>0</td><td>-</td></tr><tr><td>2</td><td>THICK</td><td>2026-09-10T08:25:00</td><td>不合格（强制出炉）</td><td>后工序急件，线长确认放行返工</td><td>-</td><td>5 / 20</td><td>15</td><td>UNDER_TIME、PROBE_GAP</td></tr></table>
+<div class="sign"><span>操作工：____________</span><span>检验员：____________</span>
+<span>日期：____________</span></div>
+</body></html>

@@ -67,7 +67,22 @@ CREATE TABLE IF NOT EXISTS batches (
     planned_unload_at     TEXT,
     actual_load_at        TEXT,
     actual_unload_at      TEXT,
+    -- 停机避让：因避让停机窗增加的等待分钟；schedule_basis_json 为完整计算依据
+    blackout_wait_minutes REAL NOT NULL DEFAULT 0,
+    schedule_basis_json   TEXT,
     created_at            TEXT NOT NULL
+);
+
+-- 停机窗（清炉/校准/检修）：随试算写入排产版本快照，后续试算可整体改写
+CREATE TABLE IF NOT EXISTS blackout_windows (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    version_id INTEGER NOT NULL REFERENCES schedule_versions(id),
+    oven_id    TEXT NOT NULL,
+    kind       TEXT NOT NULL,   -- CLEANING 清炉 / CALIBRATION 校准 / MAINTENANCE 检修
+    start_at   TEXT NOT NULL,
+    end_at     TEXT NOT NULL,
+    note       TEXT,
+    created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS batch_items (
@@ -184,6 +199,12 @@ def close_db(exc=None):
 def init_db():
     db = get_db()
     db.executescript(SCHEMA)
+    # 兼容旧库：为 batches 补齐停机避让列
+    existing = {r["name"] for r in db.execute("PRAGMA table_info(batches)")}
+    for col, typ in {"blackout_wait_minutes": "REAL NOT NULL DEFAULT 0",
+                     "schedule_basis_json": "TEXT"}.items():
+        if col not in existing:
+            db.execute(f"ALTER TABLE batches ADD COLUMN {col} {typ}")
     # 兼容旧库：为 batch_items 补齐签发快照列与逐件出炉列
     existing = {r["name"] for r in db.execute("PRAGMA table_info(batch_items)")}
     snapshot_cols = {"snap_length_mm": "REAL", "snap_width_mm": "REAL",

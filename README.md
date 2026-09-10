@@ -22,6 +22,7 @@ bash samples/scenario_a_normal.sh             # 正常闭环
 bash samples/scenario_b_conflicts_rework.sh   # 冲突/越序/返工/版本链
 bash samples/scenario_c_probes.sh             # 多探头测温/停用故障探头
 bash samples/scenario_d_piece_unload.sh       # 轻薄/厚重混炉逐件出炉、强制出炉
+bash samples/scenario_e_blackout.sh           # 停机窗避让/冲突/逐炉时间线
 
 # 回归测试（不依赖服务进程）
 python3 -m unittest discover -s tests -v
@@ -46,6 +47,7 @@ samples/
   scenario_b_conflicts_rework.sh   样例二：冲突/返工/版本
   scenario_c_probes.sh             样例三：多探头测温
   scenario_d_piece_unload.sh       样例四：逐件出炉/强制出炉
+  scenario_e_blackout.sh           样例五：停机窗避让/冲突/时间线
   out/                             样例下载产物（档案 JSON、随炉卡 HTML）
 ```
 
@@ -57,6 +59,24 @@ samples/
 - 工件占用挂位数 = max(按水平尺寸/吊点间距， 按重量/单吊点承重)，取相邻挂位；
 - 升温分钟 = (窗口中值 − 环境温度)/升温速率 + 装载公斤 × 热惯性系数；
 - 同炉次按工件交期先后串行衔接，已签发/在炉炉次占用炉膛的时间段自动避让；
+- **停机窗（清炉/校准/检修）**：试算请求可带 `blackout_windows`
+  （每段含 `oven_id`、`kind`、`start_at`、`end_at`、`note`；
+  `kind` 支持 `CLEANING`/`CALIBRATION`/`MAINTENANCE` 或中文 清炉/校准/检修）。
+  起止倒序、同炉重叠、未知炉号一律 400 拒绝。
+  排产时**装载、升温、保温及周转是一个不可拆分的占用区间**，撞上停机窗
+  便整体移到该窗结束之后，再比较各炉完工时刻与交期；
+- 每个新炉次返回**因避让增加的等待分钟**（`blackout_wait_minutes`）与
+  **逾期变化**（`lateness_minutes` / `baseline_lateness_minutes` /
+  `lateness_delta_minutes`，按炉内最早交期衡量），以及未避让的基准时刻
+  （`baseline_load_at` / `baseline_unload_at`）和被避让的窗口；
+- 试算响应带**逐炉时间线**（`oven_timelines`）：区分生产占用 `PRODUCTION`、
+  周转 `TURNAROUND` 与停机 `BLACKOUT`，并给出各炉完工/释放时刻与逾期汇总；
+- 停机窗写入**排产版本快照**（`blackout_windows` 表 + 版本 `params_json`），
+  后续试算可整体改写；**已签发/在炉炉次不得改时刻**——若新窗口撞上这些炉次
+  的占用区间（计划入炉 → 计划出炉+周转），响应 `blackout_conflicts` 列出
+  每处重叠区间与冲突分钟（仅告警，试算照常完成）；
+- 炉次详情、版本查询（`GET /versions/<id>`）与 JSON 档案均保留关联停机窗
+  及计算依据（`schedule_basis`）；
 - 无法安排的工件进入 `unscheduled` 并给出具体原因：
   `OVERSIZE`（尺寸超炉膛/挂位跨度）、`OVERWEIGHT`（超吊点承重）、
   `UNKNOWN_POWDER`（粉料批号未登记；该订单不入库，登记粉料后重新提交即可排产。
@@ -174,6 +194,9 @@ samples/
 ### 版本机制
 每次试算生成一个 `schedule_versions` 记录（`parent_id` 指向上版本，参数快照存档）：
 - **已签发/在炉炉次原样保留**（响应 `carried_batches`），其炉膛占用被新计划避让；
+- **停机窗随版本快照存档**（`blackout_windows` 表 + 版本参数），后续试算可
+  整体改写；新窗口撞上已签发/在炉炉次时在 `blackout_conflicts` 中列出
+  重叠区间与冲突分钟，这些炉次时刻不变；
 - 签发时对炉内工件的尺寸、重量、粉料固化窗口与**探头配置**做快照
   （`batch_items.snap_*` / `batch_item_probes`），
   后续修改主数据或生成新版本，均不改变已签发炉次的查询结果与出炉判定；
@@ -183,7 +206,7 @@ samples/
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/schedule/trial` | 试算：排出炉次/挂位/升温/保温/出炉时刻，形成关联版本 |
+| POST | `/schedule/trial` | 试算：排出炉次/挂位/升温/保温/出炉时刻（避让停机窗），形成关联版本；响应含逐炉时间线与停机冲突清单 |
 | POST | `/batches/<id>/issue` | 签发（DRAFT→ISSUED，冻结工件/粉料/探头快照） |
 | POST | `/batches/<id>/load` | 入炉（ISSUED→IN_OVEN），body 可带 `at` |
 | POST | `/batches/<id>/readings` | 测温回传（仅 IN_OVEN 且工件仍在炉），`readings:[{workpiece_id,probe_id,ts,metal_temp_c}]`，接受后即时重算进度 |
@@ -201,7 +224,8 @@ samples/
 | GET  | `/batches/<id>/archive` | 下载 JSON 炉次档案 |
 | GET  | `/batches/<id>/card` | 可打印随炉卡（HTML，含探头与判定序列） |
 | GET  | `/workpieces/<id>` | 工件状态、探头、履历、标记 |
-| GET  | `/versions` | 排产版本链 |
+| GET  | `/versions` | 排产版本链（含各版本炉次数与停机窗数） |
+| GET  | `/versions/<id>` | 版本详情：参数快照（含停机窗）与该版本排出的炉次 |
 | GET  | `/health` | 健康检查 |
 
 ### 应用配置（`create_app` 可覆盖）
@@ -224,9 +248,13 @@ samples/
                "turnaround_minutes","hanger_slots","hanger_spacing_mm","hanger_max_load_kg"}],
   "powders": [{"batch_no","temp_min_c","temp_max_c","hold_minutes"}],
   "forbidden_pairs": [["GRP_A","GRP_B"]],
+  "blackout_windows": [{"oven_id","kind","start_at","end_at","note"}],
   "orders":  [{"workpiece_id","order_id","length_mm","width_mm","height_mm",
                "weight_kg","powder_batch","compat_group","due_at"}]
 }
 ```
+
+`blackout_windows` 可省略；`kind` 取 `CLEANING`（清炉）/ `CALIBRATION`（校准）/
+`MAINTENANCE`（检修），也接受中文 清炉/校准/检修。
 
 时间为本地 ISO 格式（可带时区，将转为本地时间存储）。
