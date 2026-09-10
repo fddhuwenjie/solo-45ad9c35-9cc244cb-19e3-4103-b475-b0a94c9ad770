@@ -165,6 +165,153 @@ def _cure_summary(c):
     }
 
 
+def _cure_defects(c):
+    """按出炉判定口径从固化分析提取该件不合格标记（代码 + 明细文案）。
+
+    与整炉出炉原逐件打标逻辑一致：欠时/超温/缺报/卡值（启用探头）/
+    温差/有效探头不足均为不合格；禁配冲突单独由 _incompat_defects 给出。
+    """
+    defects = []
+    if c["under_time"]:
+        defects.append((FLAG_UNDER_TIME,
+                        f"许可区间累计 {c['in_window_minutes']} 分钟，"
+                        f"不足要求的 {c['required_hold_minutes']} 分钟"))
+    if c["over_temp"]:
+        defects.append((FLAG_OVER_TEMP,
+                        f"金属温度最高 {c['max_temp_c']}℃，超过粉料上限"))
+    if c["probe_gaps"]:
+        defects.append((FLAG_PROBE_GAP,
+                        "探头缺报: " + json.dumps(c["probe_gaps"], ensure_ascii=False)))
+    stuck = [a for p in c["probes"] if p["status"] == "ACTIVE"
+             for a in p["anomalies"]]
+    if stuck:
+        defects.append((FLAG_STUCK_PROBE,
+                        "探头卡值: " + json.dumps(stuck, ensure_ascii=False)))
+    if c["divergences"]:
+        defects.append((FLAG_PROBE_DIVERGENCE,
+                        "探头温差: " + json.dumps(c["divergences"], ensure_ascii=False)))
+    if c["insufficient_probes"]:
+        defects.append((FLAG_INSUFFICIENT_PROBES,
+                        f"有效探头 {c['valid_probe_count']} 个，"
+                        f"少于设定的 {c['min_valid_probes']} 个，不得判定合格"))
+    return defects
+
+
+def _incompat_defects(db, bid, wid, forbidden):
+    """该件与炉内任一同炉禁配组成员的冲突标记（逐件出炉复用同一判定）。"""
+    me = db.execute(
+        "SELECT compat_group FROM workpieces WHERE id=?", (wid,)).fetchone()
+    if not me or not me["compat_group"] or not forbidden:
+        return []
+    others = db.execute(
+        "SELECT w.id, w.compat_group FROM batch_items bi"
+        " JOIN workpieces w ON w.id = bi.workpiece_id"
+        " WHERE bi.batch_id=? AND bi.workpiece_id<>?", (bid, wid)).fetchall()
+    defects = []
+    seen = set()
+    for o in others:
+        g2 = o["compat_group"]
+        if g2 and ((me["compat_group"], g2) in forbidden
+                   or (g2, me["compat_group"]) in forbidden) and o["id"] not in seen:
+            seen.add(o["id"])
+            defects.append((FLAG_INCOMPAT,
+                            f"与 {o['id']} 属同炉禁配组 {me['compat_group']}/{g2}"))
+    return defects
+
+
+def _judge_piece(db, b, wid, at):
+    """单件出炉判定：安全条件 + 累计/剩余/阻塞原因，供单件与整炉出炉复用。
+
+    安全条件 = 截至 at 已达标（progress 状态 MET）且无任何不合格标记
+    （历史超温/缺报/卡值/温差/有效探头不足/欠时/禁配冲突）。
+    返回 {safe, verdict, cure, project, defects:[(code,detail)], blockers}；
+    blockers 合并进度阻塞（欠温/超温/缺报/读数陈旧/探头不足/无读数）与
+    其余不合格标记明细，普通请求据此拒绝。
+    """
+    c = _cure_for_item(db, b, wid, as_of=at)
+    version = db.execute("SELECT params_json FROM schedule_versions WHERE id=?",
+                         (b["version_id"],)).fetchone()
+    forbidden = set()
+    if version:
+        for pair in json.loads(version["params_json"]).get("forbidden_pairs", []):
+            forbidden.add((pair[0], pair[1]))
+    defects = _incompat_defects(db, b["id"], wid, forbidden) + _cure_defects(c)
+    proj = _item_project(db, b, wid, at)
+
+    blockers = [dict(x) for x in proj["blockers"]]
+    have = {x["code"] for x in blockers}
+    # 已达标但历史上存在不合格标记（历史超温/缺报/卡值等）同样阻止安全出炉
+    for code, detail in defects:
+        if code not in have:
+            blockers.append({"code": code, "message": detail})
+            have.add(code)
+    safe = not defects and proj["status"] == progress.STATUS_MET
+    return {"safe": safe, "verdict": "OK" if safe else "NOT_OK", "cure": c,
+            "project": proj, "defects": defects, "blockers": blockers}
+
+
+def _apply_piece_unload(db, bid, wid, judgment, at, forced, reason):
+    """执行单件离炉：写标记/工件状态/逐件离炉列/审计；返回离炉结果 dict。
+
+    强制出炉：最终判定一律 NOT_OK（REWORK_PENDING），并保留所有已观测
+    不合格标记；普通安全出炉：无标记，最终判定 OK（DONE）。
+    """
+    at_iso = at.isoformat()
+    codes = []
+    for code, detail in judgment["defects"]:
+        _add_flag(db, bid, wid, code, detail)
+        codes.append(code)
+    # 强制出炉一律标记不合格；普通离炉以安全条件为准
+    if forced:
+        verdict, wstatus = "NOT_OK", "REWORK_PENDING"
+    else:
+        verdict = "OK" if judgment["safe"] else "NOT_OK"
+        wstatus = "DONE" if judgment["safe"] else "REWORK_PENDING"
+    seq_row = db.execute(
+        "SELECT COALESCE(MAX(unload_sequence), 0) AS n FROM batch_items"
+        " WHERE batch_id=?", (bid,)).fetchone()
+    seq = seq_row["n"] + 1
+    proj = judgment["project"]
+    snap = json.dumps(proj, ensure_ascii=False)
+    db.execute(
+        "UPDATE batch_items SET actual_unload_at=?, unload_sequence=?,"
+        " first_met_at=?, final_verdict=?, forced=?, force_reason=?,"
+        " progress_snapshot_json=? WHERE batch_id=? AND workpiece_id=?",
+        (at_iso, seq, proj["first_met_at"], verdict,
+         1 if forced else 0, reason if forced else None, snap, bid, wid))
+    db.execute(
+        "INSERT INTO unload_actions (batch_id, workpiece_id, sequence, verdict,"
+        " forced, reason, flags_json, snapshot_json, unload_at, created_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (bid, wid, seq, verdict, 1 if forced else 0,
+         reason if forced else None, json.dumps(codes, ensure_ascii=False),
+         snap, at_iso, _now().isoformat()))
+    db.execute("UPDATE workpieces SET status=? WHERE id=?", (wstatus, wid))
+    return {"workpiece_id": wid, "verdict": verdict, "forced": forced,
+            "reason": reason if forced else None, "flags": codes,
+            "unload_at": at_iso, "sequence": seq,
+            "first_met_at": proj["first_met_at"],
+            "in_window_minutes": proj["in_window_minutes"],
+            "remaining_hold_minutes": proj["remaining_hold_minutes"],
+            "progress_snapshot": proj}
+
+
+def _finalize_batch_if_empty(db, bid, at):
+    """炉内已无工件时炉次转 UNLOADED，actual_unload_at 取最后离炉时刻。"""
+    remaining = db.execute(
+        "SELECT COUNT(*) AS n FROM batch_items WHERE batch_id=?"
+        " AND actual_unload_at IS NULL", (bid,)).fetchone()["n"]
+    if remaining:
+        return None
+    row = db.execute(
+        "SELECT MAX(actual_unload_at) AS last_at FROM batch_items WHERE batch_id=?",
+        (bid,)).fetchone()
+    last_at = max(row["last_at"], at.isoformat()) if row["last_at"] else at.isoformat()
+    db.execute("UPDATE batches SET state='UNLOADED', actual_unload_at=? WHERE id=?",
+               (last_at, bid))
+    return last_at
+
+
 def _item_window(db, batch_id, workpiece_id):
     """工件在该炉次的固化窗口与保温要求（已签发取快照，草稿取当前主数据）。"""
     r = db.execute(
@@ -194,43 +341,78 @@ def _resolve_as_of(b, requested, now=None):
     return now, "now"
 
 
+def _item_project(db, b, wid, as_of):
+    """单件在炉进度与安全出炉预测（读数按 as_of 截断，窗口/探头取签发快照）。"""
+    wmin, wmax, hold = _item_window(db, b["id"], wid)
+    rows = db.execute(
+        "SELECT ts, probe_id, metal_temp_c FROM readings"
+        " WHERE batch_id=? AND workpiece_id=? AND ts <= ? ORDER BY ts, id",
+        (b["id"], wid, as_of.isoformat())).fetchall()
+    pts = [(datetime.fromisoformat(r["ts"]), r["probe_id"], r["metal_temp_c"])
+           for r in rows]
+    cfg = _probe_cfg_for_item(
+        db, b["id"], wid,
+        frozen=b["state"] not in ("DRAFT", "SUPERSEDED"))
+    return progress.project_item(
+        pts,
+        {pid: {"offset_c": c["offset_c"], "status": c["status"]}
+         for pid, c in cfg.items()},
+        wmin, wmax, hold, as_of, current_app.config["PROBE_GAP_MINUTES"],
+        current_app.config["PROBE_DIVERGENCE_C"],
+        current_app.config["STUCK_PROBE_MIN_CONSECUTIVE"],
+        current_app.config["MIN_VALID_PROBES"])
+
+
 def _batch_progress(db, b, as_of, basis_source, computed_at=None):
     """构建炉次级在炉固化进度与安全出炉预测（逐件 project_item + 汇总）。
 
     读数按 as_of 截断，签发快照窗口/探头配置，缺报窗口末端取 as_of。
     计划出炉时刻取签发时冻结的 planned_unload_at，本计算不改写它。
+    汇总仅计算在炉工件：已离炉（actual_unload_at <= as_of）的工件跳过，
+    其离炉当时的进度快照保留在 batch_items.progress_snapshot_json 中。
     """
-    cfg_gap = current_app.config["PROBE_GAP_MINUTES"]
     item_rows = db.execute(
-        "SELECT workpiece_id FROM batch_items WHERE batch_id=? ORDER BY hanger_slot",
+        "SELECT workpiece_id, actual_unload_at FROM batch_items"
+        " WHERE batch_id=? ORDER BY hanger_slot",
         (b["id"],)).fetchall()
     items = []
     for r in item_rows:
-        wid = r["workpiece_id"]
-        wmin, wmax, hold = _item_window(db, b["id"], wid)
-        rows = db.execute(
-            "SELECT ts, probe_id, metal_temp_c FROM readings"
-            " WHERE batch_id=? AND workpiece_id=? AND ts <= ? ORDER BY ts, id",
-            (b["id"], wid, as_of.isoformat())).fetchall()
-        pts = [(datetime.fromisoformat(r["ts"]), r["probe_id"], r["metal_temp_c"])
-               for r in rows]
-        cfg = _probe_cfg_for_item(
-            db, b["id"], wid,
-            frozen=b["state"] not in ("DRAFT", "SUPERSEDED"))
-        item = {"workpiece_id": wid,
-                **progress.project_item(
-                    pts,
-                    {pid: {"offset_c": c["offset_c"], "status": c["status"]}
-                     for pid, c in cfg.items()},
-                    wmin, wmax, hold, as_of, cfg_gap,
-                    current_app.config["PROBE_DIVERGENCE_C"],
-                    current_app.config["STUCK_PROBE_MIN_CONSECUTIVE"],
-                    current_app.config["MIN_VALID_PROBES"])}
-        items.append(item)
+        if r["actual_unload_at"]:
+            # 历史复盘（as_of 早于该件离炉时刻）时该件当时仍在炉，照常计入
+            if datetime.fromisoformat(r["actual_unload_at"]) <= as_of:
+                continue
+        items.append({"workpiece_id": r["workpiece_id"],
+                      **_item_project(db, b, r["workpiece_id"], as_of)})
     planned = (datetime.fromisoformat(b["planned_unload_at"])
                if b["planned_unload_at"] else None)
     return progress.summarize(items, planned, as_of,
                               computed_at or _now(), basis_source)
+
+
+def _frozen_progress(db, b, computed_at=None):
+    """整炉离炉后的只读进度汇总。
+
+    逐件取离炉当时冻结的 project_item 快照（旧库无快照的退化为按最后离炉
+    时刻重算），基准时刻取炉次实际出炉时刻（= 最后一件离炉时刻），
+    汇总不再随后续时间或读数漂移。
+    """
+    as_of = datetime.fromisoformat(b["actual_unload_at"])
+    rows = db.execute(
+        "SELECT workpiece_id, progress_snapshot_json FROM batch_items"
+        " WHERE batch_id=? AND actual_unload_at IS NOT NULL"
+        " ORDER BY unload_sequence", (b["id"],)).fetchall()
+    items = []
+    for r in rows:
+        if r["progress_snapshot_json"]:
+            snap = json.loads(r["progress_snapshot_json"])
+        else:
+            snap = _item_project(db, b, r["workpiece_id"], as_of)
+        snap["workpiece_id"] = r["workpiece_id"]
+        items.append(snap)
+    planned = (datetime.fromisoformat(b["planned_unload_at"])
+               if b["planned_unload_at"] else None)
+    return progress.summarize(items, planned, as_of,
+                              computed_at or _now(), "actual_unload_at")
 
 
 def _batch_payload(db, b, as_of=None, as_of_source=None):
@@ -241,7 +423,9 @@ def _batch_payload(db, b, as_of=None, as_of_source=None):
         " COALESCE(bi.snap_height_mm, w.height_mm) AS height_mm,"
         " COALESCE(bi.snap_weight_kg, w.weight_kg) AS weight_kg,"
         " COALESCE(bi.snap_powder_batch, w.powder_batch) AS powder_batch,"
-        " w.compat_group, w.due_at, w.is_rework, w.status"
+        " w.compat_group, w.due_at, w.is_rework, w.status,"
+        " bi.actual_unload_at, bi.unload_sequence, bi.first_met_at,"
+        " bi.final_verdict, bi.forced, bi.force_reason, bi.progress_snapshot_json"
         " FROM batch_items bi JOIN workpieces w ON w.id = bi.workpiece_id"
         " WHERE bi.batch_id=? ORDER BY bi.hanger_slot",
         (b["id"],),
@@ -271,14 +455,38 @@ def _batch_payload(db, b, as_of=None, as_of_source=None):
             )
         ]
         out_items.append({
-            **dict(it),
+            **{k: it[k] for k in it.keys()
+               if k not in ("forced", "progress_snapshot_json")},
             "is_rework": bool(it["is_rework"]),
+            "forced": bool(it["forced"]),
             "cure": _cure_for_item(db, b, wid),
             "flags": flags,
             "probe_actions": probe_actions,
+            # 离炉当时冻结的进度快照（在炉时为 None）
+            "progress_snapshot": (json.loads(it["progress_snapshot_json"])
+                                  if it["progress_snapshot_json"] else None),
         })
     resolved_as_of, default_source = _resolve_as_of(b, as_of)
     basis_source = as_of_source if as_of is not None else default_source
+    # 整炉已离炉且未指定历史基准：逐件取离炉当时冻结快照，不再随时间漂移；
+    # 其余情况（在炉/历史复盘）按基准时刻重算，且只汇总仍在炉的工件
+    if as_of is None and b["state"] in ("UNLOADED", "CLOSED") \
+            and b["actual_unload_at"]:
+        progress_snapshot = _frozen_progress(db, b)
+    else:
+        progress_snapshot = _batch_progress(db, b, resolved_as_of, basis_source)
+    # 逐件离炉顺序（序号、时刻、判定、强制原因、当时进度快照）
+    unload_order = [
+        {"sequence": a["sequence"], "workpiece_id": a["workpiece_id"],
+         "unload_at": a["unload_at"], "verdict": a["verdict"],
+         "forced": bool(a["forced"]), "reason": a["reason"],
+         "flags": json.loads(a["flags_json"]),
+         "progress_snapshot": json.loads(a["snapshot_json"])}
+        for a in db.execute(
+            "SELECT sequence, workpiece_id, unload_at, verdict, forced, reason,"
+            " flags_json, snapshot_json FROM unload_actions"
+            " WHERE batch_id=? ORDER BY sequence", (b["id"],)).fetchall()
+    ]
     return {
         "batch_id": b["id"],
         "version_id": b["version_id"],
@@ -299,8 +507,9 @@ def _batch_payload(db, b, as_of=None, as_of_source=None):
         "actual": {"load_at": b["actual_load_at"], "unload_at": b["actual_unload_at"]},
         "created_at": b["created_at"],
         "items": out_items,
+        "unload_order": unload_order,
         # 同一进度快照贯穿炉次详情 / JSON 档案 / 随炉卡
-        "progress": _batch_progress(db, b, resolved_as_of, basis_source),
+        "progress": progress_snapshot,
     }
 
 
@@ -599,6 +808,10 @@ def add_readings(bid):
         return _err(400, "缺少 readings（或单条 workpiece_id/ts/metal_temp_c）")
     valid = {r["workpiece_id"] for r in db.execute(
         "SELECT workpiece_id FROM batch_items WHERE batch_id=?", (bid,)).fetchall()}
+    # 已逐件离炉的工件不再接收读数
+    left_at = dict(db.execute(
+        "SELECT workpiece_id, actual_unload_at FROM batch_items"
+        " WHERE batch_id=? AND actual_unload_at IS NOT NULL", (bid,)).fetchall())
     # 签发时冻结的探头配置：{工件: {探头: 状态}}
     probe_cfg = {}
     for r in db.execute(
@@ -614,6 +827,11 @@ def add_readings(bid):
         if wid not in valid:
             rejected.append({"workpiece_id": wid, "probe_id": pid,
                              "reason": "工件不在该炉次"})
+            continue
+        if wid in left_at:
+            rejected.append({"workpiece_id": wid, "probe_id": pid,
+                             "reason": f"工件已于 {left_at[wid]} 离炉，"
+                                       "离炉后不再接收读数"})
             continue
         try:
             ts = _parse_dt(e["ts"], "ts")
@@ -662,9 +880,83 @@ def add_readings(bid):
                                                 computed_at=now)})
 
 
+@bp.post("/batches/<int:bid>/workpieces/<wid>/unload")
+def unload_workpiece(bid, wid):
+    """逐件出炉：按 at 判定单件是否达到安全出炉条件。
+
+    普通请求（force 非真）：未达到安全条件时拒绝（409）并返回该件累计、
+    剩余时间与阻塞原因，不留离炉记录；安全时该件离炉（DONE）。
+    强制出炉（force=true）：必须填写 reason；保留不合格标记，最终判定
+    NOT_OK（REWORK_PENDING），并写 unload_actions 审计。
+    还有工件在炉时炉次保持 IN_OVEN；最后一件离炉后炉次自动转 UNLOADED，
+    actual_unload_at 取最后离炉时刻。
+    """
+    db = get_db()
+    b = _fetch_batch(db, bid)
+    if b is None:
+        return _err(404, f"炉次 {bid} 不存在")
+    item = db.execute(
+        "SELECT actual_unload_at FROM batch_items WHERE batch_id=? AND workpiece_id=?",
+        (bid, wid)).fetchone()
+    if item is None:
+        return _err(404, f"工件 {wid} 不在炉次 {bid} 中")
+    if item["actual_unload_at"] is not None:
+        return _err(409,
+                    f"工件 {wid} 已于 {item['actual_unload_at']} 离炉，不能重复出炉",
+                    state=b["state"], unload_at=item["actual_unload_at"])
+    if b["state"] == "DRAFT":
+        _add_flag(db, bid, wid, FLAG_UNISSUED_UNLOAD,
+                  "炉次未签发即请求逐件出炉")
+        db.commit()
+        return _err(409, "炉次未签发，禁止出炉；已记录 UNISSUED_UNLOAD 标记",
+                    state=b["state"])
+    if b["state"] != "IN_OVEN":
+        return _err(409, f"炉次状态为 {b['state']}，不能逐件出炉（要求 IN_OVEN）",
+                    state=b["state"])
+    data = request.get_json(silent=True) or {}
+    try:
+        at = _parse_dt(data["at"], "at") if data.get("at") else _now()
+    except ValueError as e:
+        return _err(400, str(e))
+    force = bool(data.get("force"))
+    reason = str(data.get("reason") or "").strip() or None
+
+    judgment = _judge_piece(db, b, wid, at)
+    if force and not reason:
+        return _err(400, "强制出炉必须填写原因 reason")
+    if not judgment["safe"] and not force:
+        return _err(409, f"工件 {wid} 未达到安全出炉条件，拒绝出炉；"
+                         "如确认强制出炉请带 force=true 与 reason",
+                    state=b["state"],
+                    workpiece_id=wid,
+                    in_window_minutes=judgment["project"]["in_window_minutes"],
+                    remaining_hold_minutes=judgment["project"]["remaining_hold_minutes"],
+                    first_met_at=judgment["project"]["first_met_at"],
+                    blockers=judgment["blockers"],
+                    progress=judgment["project"])
+
+    result = _apply_piece_unload(db, bid, wid, judgment, at, force, reason)
+    last_at = _finalize_batch_if_empty(db, bid, at)
+    db.commit()
+    new_state = "UNLOADED" if last_at is not None else "IN_OVEN"
+    # 离炉后即时返回炉次进度（最后一件离炉后为逐件冻结快照汇总）
+    if last_at is not None:
+        b2 = _fetch_batch(db, bid)
+        prog = _frozen_progress(db, b2)
+    else:
+        prog = _batch_progress(db, b, at, "query", computed_at=_now())
+    return jsonify({"batch_id": bid, "state": new_state,
+                    "actual_unload_at": last_at,
+                    "result": result, "progress": prog})
+
+
 @bp.post("/batches/<int:bid>/unload")
 def unload(bid):
-    """出炉判定：IN_OVEN -> UNLOADED，逐件评估并打标记。"""
+    """整炉出炉判定：逐件复用同一判定，已离炉工件跳过。
+
+    IN_OVEN -> UNLOADED（全部工件此前已离炉时立即转换）；仍在炉的工件按
+    同一套安全/不合格口径逐件落判定与标记。actual_unload_at 取最后离炉时刻。
+    """
     db = get_db()
     b = _fetch_batch(db, bid)
     if b is None:
@@ -688,65 +980,51 @@ def unload(bid):
     except ValueError as e:
         return _err(400, str(e))
 
-    # 禁配冲突检查（按该炉次所属版本的禁配组判定）
+    # 仍在炉的工件逐件复用同一判定；已离炉工件跳过（保留其既有判定）
+    rows = db.execute(
+        "SELECT bi.workpiece_id FROM batch_items bi"
+        " WHERE bi.batch_id=? AND bi.actual_unload_at IS NULL"
+        " ORDER BY bi.hanger_slot", (bid,)).fetchall()
+    skipped = [r["workpiece_id"] for r in db.execute(
+        "SELECT workpiece_id FROM batch_items WHERE batch_id=?"
+        " AND actual_unload_at IS NOT NULL ORDER BY unload_sequence", (bid,)).fetchall()]
+    # 禁配冲突按炉内成对判定：与原整炉出炉一致，互为冲突的双方都落标记
     version = db.execute("SELECT params_json FROM schedule_versions WHERE id=?",
                          (b["version_id"],)).fetchone()
     forbidden = set()
     if version:
         for pair in json.loads(version["params_json"]).get("forbidden_pairs", []):
             forbidden.add((pair[0], pair[1]))
-    items = db.execute(
-        "SELECT bi.workpiece_id, w.compat_group FROM batch_items bi"
-        " JOIN workpieces w ON w.id = bi.workpiece_id WHERE bi.batch_id=?",
-        (bid,)).fetchall()
-    for i in range(len(items)):
-        for j in range(i + 1, len(items)):
-            ga, gb = items[i]["compat_group"], items[j]["compat_group"]
-            if ga and gb and ((ga, gb) in forbidden or (gb, ga) in forbidden):
-                _add_flag(db, bid, items[i]["workpiece_id"], FLAG_INCOMPAT,
-                          f"与 {items[j]['workpiece_id']} 属同炉禁配组 {ga}/{gb}")
-                _add_flag(db, bid, items[j]["workpiece_id"], FLAG_INCOMPAT,
-                          f"与 {items[i]['workpiece_id']} 属同炉禁配组 {ga}/{gb}")
-
+    remaining = {r["workpiece_id"] for r in rows}
+    if remaining and forbidden:
+        members = {r["workpiece_id"]: r["compat_group"] for r in db.execute(
+            "SELECT bi.workpiece_id, w.compat_group FROM batch_items bi"
+            " JOIN workpieces w ON w.id = bi.workpiece_id"
+            " WHERE bi.batch_id=?", (bid,)).fetchall()}
+        pending = list(remaining)
+        for i in range(len(pending)):
+            for j in range(i + 1, len(pending)):
+                a, other = pending[i], pending[j]
+                ga, gb = members.get(a), members.get(other)
+                if ga and gb and ((ga, gb) in forbidden
+                                  or (gb, ga) in forbidden):
+                    _add_flag(db, bid, a, FLAG_INCOMPAT,
+                              f"与 {other} 属同炉禁配组 {ga}/{gb}")
+                    _add_flag(db, bid, other, FLAG_INCOMPAT,
+                              f"与 {a} 属同炉禁配组 {ga}/{gb}")
     results = []
-    for it in items:
-        wid = it["workpiece_id"]
-        c = _cure_for_item(db, b, wid)
-        if c["under_time"]:
-            _add_flag(db, bid, wid, FLAG_UNDER_TIME,
-                      f"许可区间累计 {c['in_window_minutes']} 分钟，"
-                      f"不足要求的 {c['required_hold_minutes']} 分钟")
-        if c["over_temp"]:
-            _add_flag(db, bid, wid, FLAG_OVER_TEMP,
-                      f"金属温度最高 {c['max_temp_c']}℃，超过粉料上限")
-        if c["probe_gaps"]:
-            _add_flag(db, bid, wid, FLAG_PROBE_GAP,
-                      "探头缺报: " + json.dumps(c["probe_gaps"], ensure_ascii=False))
-        stuck = [a for p in c["probes"] if p["status"] == "ACTIVE"
-                 for a in p["anomalies"]]
-        if stuck:
-            _add_flag(db, bid, wid, FLAG_STUCK_PROBE,
-                      "探头卡值: " + json.dumps(stuck, ensure_ascii=False))
-        if c["divergences"]:
-            _add_flag(db, bid, wid, FLAG_PROBE_DIVERGENCE,
-                      "探头温差: " + json.dumps(c["divergences"], ensure_ascii=False))
-        if c["insufficient_probes"]:
-            _add_flag(db, bid, wid, FLAG_INSUFFICIENT_PROBES,
-                      f"有效探头 {c['valid_probe_count']} 个，"
-                      f"少于设定的 {c['min_valid_probes']} 个，不得判定合格")
-        codes = [r["code"] for r in db.execute(
-            "SELECT code FROM flags WHERE batch_id=? AND workpiece_id=? ORDER BY id",
-            (bid, wid)).fetchall()]
-        ok = not codes
-        db.execute("UPDATE workpieces SET status=? WHERE id=?",
-                   ("DONE" if ok else "REWORK_PENDING", wid))
-        results.append({"workpiece_id": wid, "verdict": "OK" if ok else "NOT_OK",
-                        "flags": codes, "cure": c})
-    db.execute("UPDATE batches SET state='UNLOADED', actual_unload_at=? WHERE id=?",
-               (at.isoformat(), bid))
+    for r in rows:
+        wid = r["workpiece_id"]
+        judgment = _judge_piece(db, b, wid, at)
+        result = _apply_piece_unload(db, bid, wid, judgment, at, False, None)
+        # 兼容旧响应：附带完整 cure 分析
+        result["cure"] = judgment["cure"]
+        results.append(result)
+    last_at = _finalize_batch_if_empty(db, bid, at)
     db.commit()
     return jsonify({"batch_id": bid, "state": "UNLOADED",
-                    "actual_unload_at": at.isoformat(), "results": results})
+                    "actual_unload_at": last_at, "results": results,
+                    "skipped": skipped})
 
 
 @bp.post("/batches/<int:bid>/close")
@@ -835,6 +1113,16 @@ def disable_probe(bid, wid, pid):
     if b["state"] not in ("ISSUED", "IN_OVEN"):
         return _err(409, f"炉次状态为 {b['state']}，不能停用探头（要求出炉前）",
                     state=b["state"])
+    item = db.execute(
+        "SELECT actual_unload_at FROM batch_items WHERE batch_id=? AND workpiece_id=?",
+        (bid, wid)).fetchone()
+    if item is None:
+        return _err(404, f"工件 {wid} 不在炉次 {bid} 中")
+    if item["actual_unload_at"] is not None:
+        return _err(409,
+                    f"工件 {wid} 已于 {item['actual_unload_at']} 离炉，"
+                    "离炉后不能停用探头",
+                    state=b["state"], unload_at=item["actual_unload_at"])
     data = request.get_json(silent=True) or {}
     reason = str(data.get("reason") or "").strip()
     if not reason:
@@ -965,10 +1253,16 @@ def batch_progress(bid):
     except ValueError as e:
         return _err(400, str(e))
     resolved, source = _resolve_as_of(b, as_of)
+    # 整炉已离炉且未指定历史基准：返回逐件离炉当时冻结快照的汇总
+    if as_of is None and b["state"] in ("UNLOADED", "CLOSED") \
+            and b["actual_unload_at"]:
+        prog = _frozen_progress(db, b)
+    else:
+        prog = _batch_progress(db, b, resolved, source)
     return jsonify({
         "batch_id": bid,
         "state": b["state"],
-        "progress": _batch_progress(db, b, resolved, source),
+        "progress": prog,
     })
 
 
@@ -979,15 +1273,18 @@ def workpiece_detail(wid):
     if w is None:
         return _err(404, f"工件 {wid} 不存在")
     batches = db.execute(
-        "SELECT bi.batch_id, bi.hanger_slot, bi.slots_used, b.state, b.oven_id"
+        "SELECT bi.batch_id, bi.hanger_slot, bi.slots_used, b.state, b.oven_id,"
+        " bi.actual_unload_at, bi.unload_sequence, bi.first_met_at,"
+        " bi.final_verdict, bi.forced, bi.force_reason"
         " FROM batch_items bi JOIN batches b ON b.id = bi.batch_id"
         " WHERE bi.workpiece_id=? ORDER BY bi.batch_id", (wid,)).fetchall()
     flags = db.execute(
         "SELECT batch_id, code, detail, created_at FROM flags WHERE workpiece_id=?"
         " ORDER BY id", (wid,)).fetchall()
-    return jsonify({**dict(w), "is_rework": bool(w["is_rework"]),
+    return jsonify({**{k: w[k] for k in w.keys()}, "is_rework": bool(w["is_rework"]),
                     "probes": _probes_of(db, wid),
-                    "batches": [dict(r) for r in batches],
+                    "batches": [{**dict(r), "forced": bool(r["forced"])}
+                                for r in batches],
                     "flags": [dict(r) for r in flags]})
 
 
@@ -1039,6 +1336,15 @@ def batch_card(bid):
     rows = []
     for it in p["items"]:
         flag_txt = "、".join(f["code"] for f in it["flags"]) or "-"
+        unload_txt = "-"
+        if it["actual_unload_at"]:
+            unload_txt = f"#{it['unload_sequence']} {it['actual_unload_at'][5:16]}"
+            if it["final_verdict"] == "OK":
+                unload_txt += " 合格"
+            else:
+                unload_txt += " 不合格"
+                if it["forced"]:
+                    unload_txt += "（强制）"
         rows.append(
             "<tr>"
             f"<td>{it['workpiece_id']}</td>"
@@ -1050,6 +1356,7 @@ def batch_card(bid):
             f"<td>{it['due_at'] or ''}</td>"
             f"<td>{it['cure']['in_window_minutes']:.1f} / "
             f"{it['cure']['required_hold_minutes']:.0f}</td>"
+            f"<td>{html.escape(unload_txt)}</td>"
             f"<td>{flag_txt}</td>"
             "</tr>"
         )
@@ -1134,6 +1441,37 @@ def batch_card(bid):
                      "计划出炉时刻已失效，应按预测安全出炉时刻延后",
         "CANNOT_VERIFY": "存在不可预测工件，无法判定计划出炉时刻是否有效",
     }.get(prog.get("plan_status"), "-")
+    # 逐件离炉记录：顺序、时刻、判定、强制原因与离炉当时进度快照
+    unload_rows = []
+    for u in p.get("unload_order", []):
+        snap = u.get("progress_snapshot") or {}
+        verdict_txt = "合格" if u["verdict"] == "OK" else "不合格"
+        if u["forced"]:
+            verdict_txt += "（强制出炉）"
+        unload_rows.append(
+            "<tr>"
+            f"<td>{u['sequence']}</td>"
+            f"<td>{html.escape(u['workpiece_id'])}</td>"
+            f"<td>{html.escape(u['unload_at'])}</td>"
+            f"<td>{verdict_txt}</td>"
+            f"<td>{html.escape(u['reason'] or '-')}</td>"
+            f"<td>{html.escape(str(snap.get('first_met_at') or '-'))}</td>"
+            f"<td>{snap.get('in_window_minutes', 0):g} / "
+            f"{snap.get('window', {}).get('hold_minutes', 0):g}</td>"
+            f"<td>{snap.get('remaining_hold_minutes', 0):g}</td>"
+            f"<td>{html.escape('、'.join(u['flags'])) or '-'}</td>"
+            "</tr>"
+        )
+    unload_block = (
+        "<h2>逐件离炉记录</h2>"
+        "<table>"
+        "<tr><th>顺序</th><th>工件</th><th>离炉时刻</th><th>最终判定</th>"
+        "<th>强制原因</th><th>首次达标</th><th>离炉时累计/要求 min</th>"
+        "<th>剩余 min</th><th>标记</th></tr>"
+        f"{''.join(unload_rows)}"
+        "</table>"
+    ) if p.get("unload_order") else (
+        "<h2>逐件离炉记录</h2><p class='small'>尚无工件离炉。</p>")
     html_doc = f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <title>随炉卡 · 炉次 {p['batch_id']}</title>
@@ -1165,7 +1503,7 @@ p.small {{ font-size: 12px; margin: 4px 0; }}
 </table>
 <table>
 <tr><th>工件</th><th>订单</th><th>粉料</th><th>尺寸 mm</th><th>重量 kg</th>
-    <th>挂位</th><th>交期</th><th>在区/要求 min</th><th>标记</th></tr>
+    <th>挂位</th><th>交期</th><th>在区/要求 min</th><th>离炉（顺序/时刻/判定）</th><th>标记</th></tr>
 {''.join(rows)}
 </table>
 <h2>在炉固化进度与安全出炉预测</h2>
@@ -1185,6 +1523,7 @@ p.small {{ font-size: 12px; margin: 4px 0; }}
 </table>
 <h2>探头与判定序列</h2>
 {''.join(probe_blocks)}
+{unload_block}
 <div class="sign"><span>操作工：____________</span><span>检验员：____________</span>
 <span>日期：____________</span></div>
 </body></html>"""

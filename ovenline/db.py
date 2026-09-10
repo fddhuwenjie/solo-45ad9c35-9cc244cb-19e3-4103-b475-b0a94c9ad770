@@ -84,6 +84,14 @@ CREATE TABLE IF NOT EXISTS batch_items (
     snap_temp_min_c   REAL,
     snap_temp_max_c   REAL,
     snap_hold_minutes REAL,
+    -- 逐件出炉：NULL 表示仍在炉；最后一件离炉后炉次转 UNLOADED
+    actual_unload_at      TEXT,      -- 该件实际离炉时刻
+    unload_sequence       INTEGER,   -- 炉内离炉顺序（1 起，按实际离炉先后）
+    first_met_at          TEXT,      -- 离炉时保留的首次达标时刻（永久保留）
+    final_verdict         TEXT,      -- 最终判定：OK / NOT_OK
+    forced                INTEGER NOT NULL DEFAULT 0,  -- 是否强制出炉
+    force_reason          TEXT,      -- 强制出炉原因（强制时必填）
+    progress_snapshot_json TEXT,     -- 离炉当时该件进度快照（project_item 结果）
     PRIMARY KEY (batch_id, workpiece_id)
 );
 
@@ -131,6 +139,22 @@ CREATE TABLE IF NOT EXISTS probe_actions (
     created_at   TEXT NOT NULL
 );
 
+-- 逐件出炉审计：每次单件/整炉出炉一件记录一条，含强制原因与当时进度快照
+CREATE TABLE IF NOT EXISTS unload_actions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id     INTEGER NOT NULL,
+    workpiece_id TEXT NOT NULL,
+    sequence     INTEGER NOT NULL,        -- 炉内离炉顺序（1 起）
+    verdict      TEXT NOT NULL,           -- OK / NOT_OK
+    forced       INTEGER NOT NULL DEFAULT 0,
+    reason       TEXT,                    -- 强制出炉原因（强制时必填）
+    flags_json   TEXT NOT NULL,           -- 离炉判定标记代码列表
+    snapshot_json TEXT NOT NULL,          -- 离炉当时该件进度快照（project_item 结果）
+    unload_at    TEXT NOT NULL,           -- 判定基准/实际离炉时刻（请求 at）
+    created_at   TEXT NOT NULL,
+    UNIQUE (batch_id, workpiece_id)       -- 每件在同炉次只能离炉一次
+);
+
 CREATE TABLE IF NOT EXISTS flags (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_id     INTEGER NOT NULL,
@@ -160,15 +184,37 @@ def close_db(exc=None):
 def init_db():
     db = get_db()
     db.executescript(SCHEMA)
-    # 兼容旧库：为 batch_items 补齐签发快照列
+    # 兼容旧库：为 batch_items 补齐签发快照列与逐件出炉列
     existing = {r["name"] for r in db.execute("PRAGMA table_info(batch_items)")}
     snapshot_cols = {"snap_length_mm": "REAL", "snap_width_mm": "REAL",
                      "snap_height_mm": "REAL", "snap_weight_kg": "REAL",
                      "snap_powder_batch": "TEXT", "snap_temp_min_c": "REAL",
-                     "snap_temp_max_c": "REAL", "snap_hold_minutes": "REAL"}
+                     "snap_temp_max_c": "REAL", "snap_hold_minutes": "REAL",
+                     "actual_unload_at": "TEXT", "unload_sequence": "INTEGER",
+                     "first_met_at": "TEXT", "final_verdict": "TEXT",
+                     "forced": "INTEGER NOT NULL DEFAULT 0",
+                     "force_reason": "TEXT", "progress_snapshot_json": "TEXT"}
     for col, typ in snapshot_cols.items():
         if col not in existing:
             db.execute(f"ALTER TABLE batch_items ADD COLUMN {col} {typ}")
+    # 兼容旧库：已整炉出炉的历史炉次按实际出炉时刻回填逐件离炉列
+    db.execute(
+        "UPDATE batch_items SET actual_unload_at=("
+        "  SELECT b.actual_unload_at FROM batches b WHERE b.id=batch_items.batch_id),"
+        " final_verdict=CASE WHEN EXISTS("
+        "  SELECT 1 FROM flags f WHERE f.batch_id=batch_items.batch_id"
+        "   AND f.workpiece_id=batch_items.workpiece_id) THEN 'NOT_OK' ELSE 'OK' END"
+        " WHERE actual_unload_at IS NULL AND EXISTS("
+        "  SELECT 1 FROM batches b WHERE b.id=batch_items.batch_id"
+        "   AND b.state IN ('UNLOADED','CLOSED') AND b.actual_unload_at IS NOT NULL)")
+    db.execute(
+        "UPDATE batch_items SET unload_sequence=("
+        "  SELECT COUNT(*) FROM batch_items b2 WHERE b2.batch_id=batch_items.batch_id"
+        "   AND b2.actual_unload_at IS NOT NULL"
+        "   AND (b2.actual_unload_at < batch_items.actual_unload_at"
+        "        OR (b2.actual_unload_at = batch_items.actual_unload_at"
+        "            AND b2.workpiece_id <= batch_items.workpiece_id)))"
+        " WHERE actual_unload_at IS NOT NULL AND unload_sequence IS NULL")
     # 兼容旧库：readings 补探头列，并按 (炉次, 工件, 探头, 时刻) 建幂等去重索引
     existing = {r["name"] for r in db.execute("PRAGMA table_info(readings)")}
     if "probe_id" not in existing:

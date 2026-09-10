@@ -21,6 +21,7 @@ python3 run.py                    # 监听 127.0.0.1:5000，自动建库 instanc
 bash samples/scenario_a_normal.sh             # 正常闭环
 bash samples/scenario_b_conflicts_rework.sh   # 冲突/越序/返工/版本链
 bash samples/scenario_c_probes.sh             # 多探头测温/停用故障探头
+bash samples/scenario_d_piece_unload.sh       # 轻薄/厚重混炉逐件出炉、强制出炉
 
 # 回归测试（不依赖服务进程）
 python3 -m unittest discover -s tests -v
@@ -44,6 +45,7 @@ samples/
   scenario_a_normal.sh             样例一：正常闭环
   scenario_b_conflicts_rework.sh   样例二：冲突/返工/版本
   scenario_c_probes.sh             样例三：多探头测温
+  scenario_d_piece_unload.sh       样例四：逐件出炉/强制出炉
   out/                             样例下载产物（档案 JSON、随炉卡 HTML）
 ```
 
@@ -67,7 +69,8 @@ samples/
   此后修改主数据不影响已签发炉次；
 - 测温回传携带 `probe_id`，按 **(炉次, 工件, 探头, 时刻)** 幂等去重
   （重复回传计入 `duplicates`，不重复入库）；**未绑定、已停用或早于实际入炉时刻**
-  的读数一律拒收；已绑定探头的工件必须携带 `probe_id`，
+  的读数一律拒收；**已逐件离炉的工件也按件拒收**（炉次仍 IN_OVEN 时其他在炉
+  工件照常接收）；已绑定探头的工件必须携带 `probe_id`，
   未登记探头的工件按隐式单通道接收（偏移为 0）；
 - **判定序列** = 每个采样时刻各有效（未停用）探头校正温度的**最低值**，
   固化窗口分钟数按该序列累计；各探头原始值完整保留于 readings 表；
@@ -83,6 +86,7 @@ samples/
 - **出炉前可停用故障探头**（`POST /batches/<bid>/workpieces/<wid>/probes/<pid>/disable`，
   必须填写原因）：停用后该探头读数不再参与判定且拒收新读数，
   系统**只重算该工件**并把重算前后的判定摘要记入 `probe_actions` 审计；
+  **工件已逐件离炉后不能再停用探头**（409）；
   已停用探头的历史异常区间仍保留备查；
 - 有效探头 = 未停用、有读数、且**末读数距测量窗口末端未超过缺报阈值**
   （超过缺报阈值的探头不再计为有效）；有效探头少于 `MIN_VALID_PROBES`
@@ -138,11 +142,34 @@ samples/
 
 ### 状态机（越序一律 409）
 ```
-炉次：DRAFT --签发--> ISSUED --入炉--> IN_OVEN --出炉判定--> UNLOADED --结案--> CLOSED
+炉次：DRAFT --签发--> ISSUED --入炉--> IN_OVEN --全部工件离炉--> UNLOADED --结案--> CLOSED
        └ 新试算后旧草稿 --> SUPERSEDED
 工件：PENDING --> SCHEDULED --> IN_OVEN --> DONE ----------> CLOSED
                                    └--> REWORK_PENDING --返工--> PENDING（is_rework=1）
 ```
+
+### 逐件出炉（轻薄件/厚重件不同时达标）
+同炉工件固化完成时刻不同，支持逐件离炉：
+- `POST /batches/<id>/workpieces/<wid>/unload`，body 可带 `at`（缺省当前时刻），
+  按该件**截至 `at` 的进度与全部固化标记**判定安全条件：已达标（`MET`）且无
+  欠时/超温/缺报/卡值/温差/探头不足/禁配冲突等任何不合格标记；
+- **普通请求未达安全条件 → 409 拒绝**，响应含该件 `in_window_minutes` 累计、
+  `remaining_hold_minutes` 剩余时间、`blockers` 阻塞原因与当时 `progress`，
+  不留任何离炉记录（工件继续受热，后续可再次请求）；
+- **强制出炉**须 `"force": true` 且填写 `reason`：最终判定一律 `NOT_OK`、
+  工件转 `REWORK_PENDING`，保留全部不合格标记，并写 `unload_actions` 审计
+  （顺序、判定、强制原因、离炉时刻与当时进度快照）；只给 `force` 不给原因 → 400；
+- 工件**离炉后**：不再接收读数（按件拒收并注明离炉时刻）、不能停用探头、
+  不能重复出炉（409）；
+- 还有工件在炉时炉次保持 `IN_OVEN`，炉次进度汇总**只计算在炉工件**；
+  已离炉工件保留**首次达标时刻、实际离炉时刻、最终判定与离炉当时进度快照**；
+- **最后一件离炉后**炉次自动转 `UNLOADED`，`actual_unload_at` 取最后离炉时刻；
+  逐件离炉顺序从 1 编号（先离炉序号小）；
+- **整炉出炉**接口复用同一单件判定：对仍在炉的工件逐件落判定/标记/审计，
+  已离炉工件出现在响应 `skipped` 中，其判定不被重写；
+- 炉次详情、JSON 档案、随炉卡均给出 `unload_order`（离炉顺序、强制原因、
+  当时进度快照）；整炉离炉后进度汇总改取逐件离炉时冻结的快照，不再随时间漂移。
+
 
 ### 版本机制
 每次试算生成一个 `schedule_versions` 记录（`parent_id` 指向上版本，参数快照存档）：
@@ -159,9 +186,10 @@ samples/
 | POST | `/schedule/trial` | 试算：排出炉次/挂位/升温/保温/出炉时刻，形成关联版本 |
 | POST | `/batches/<id>/issue` | 签发（DRAFT→ISSUED，冻结工件/粉料/探头快照） |
 | POST | `/batches/<id>/load` | 入炉（ISSUED→IN_OVEN），body 可带 `at` |
-| POST | `/batches/<id>/readings` | 测温回传（仅 IN_OVEN），`readings:[{workpiece_id,probe_id,ts,metal_temp_c}]`，接受后即时重算进度 |
-| GET  | `/batches/<id>/progress` | 在炉固化进度与安全出炉预测（可带 `?as_of=` 计算基准，逐件状态/阻塞/告警，炉次级最晚安全出炉与计划过早分钟） |
-| POST | `/batches/<id>/unload` | 出炉判定（IN_OVEN→UNLOADED），逐件给 verdict 与标记 |
+| POST | `/batches/<id>/readings` | 测温回传（仅 IN_OVEN 且工件仍在炉），`readings:[{workpiece_id,probe_id,ts,metal_temp_c}]`，接受后即时重算进度 |
+| GET  | `/batches/<id>/progress` | 在炉固化进度与安全出炉预测（可带 `?as_of=` 计算基准，逐件状态/阻塞/告警，炉次级最晚安全出炉与计划过早分钟）；**汇总仅计算仍在炉工件** |
+| POST | `/batches/<id>/workpieces/<wid>/unload` | **逐件出炉**：按 `at` 判定单件；不达标普通请求 409（给累计/剩余/阻塞原因），`force=true`+`reason` 强制出炉（不合格+审计） |
+| POST | `/batches/<id>/unload` | 整炉出炉判定：逐件复用同一判定，**已离炉工件跳过**；最后一件离炉后炉次 UNLOADED |
 | POST | `/batches/<id>/close` | 炉次结案（存在未了结工件时 409 并列出） |
 | POST | `/workpieces/<id>/probes` | 登记/更新工件探头及校准偏移（签发时冻结快照） |
 | GET  | `/workpieces/<id>/probes` | 工件已登记探头列表 |
