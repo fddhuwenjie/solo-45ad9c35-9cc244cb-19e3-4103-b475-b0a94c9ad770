@@ -1,7 +1,12 @@
 """固化判定：按工件金属温度处于许可区间的累计分钟数评估。
 
-累计规则：相邻两个测温点都落在 [temp_min, temp_max] 内时，
-该区间时长计入有效固化分钟数（保守口径，避免把升温沿计入）。
+累计规则：
+- 相邻两个测温点都落在 [temp_min, temp_max] 内时，该区间时长计入有效
+  固化分钟（保守口径，避免把升温沿计入）；
+- 相邻测温点间隔超过缺报阈值（gap_threshold_minutes）时，中间温度无法
+  验证，该区间既不计入保温，也**切断连续保温段**：缺报前已累计的分钟全部
+  作废，读数恢复后只从重新得到验证的连续段（最后一次缺报之后的在窗区间）
+  重新累计。缺报本身仍保留在 probe_gaps 中作为告警/标记。
 """
 from __future__ import annotations
 
@@ -12,6 +17,8 @@ def evaluate(readings, temp_min, temp_max, hold_minutes, gap_threshold_minutes=1
     readings: [(datetime, 金属温度℃)]，须按时间升序
     返回: dict（累计分钟数、欠时/超温/探头中断判定）
     """
+    # 只保留最近一个「无缺报、连续在窗口」段的累计分钟：
+    # 内部缺报清零，读数恢复后从 0 重新累计
     in_window = 0.0
     gaps = []
     max_temp = None
@@ -33,6 +40,9 @@ def evaluate(readings, temp_min, temp_max, hold_minutes, gap_threshold_minutes=1
                 "to": t1.isoformat(timespec="seconds"),
                 "minutes": round(dt, 2),
             })
+            # 缺报切断连续保温：该区间无法验证，此前累计作废
+            in_window = 0.0
+            continue
         if temp_min <= v0 <= temp_max and temp_min <= v1 <= temp_max:
             in_window += dt
 

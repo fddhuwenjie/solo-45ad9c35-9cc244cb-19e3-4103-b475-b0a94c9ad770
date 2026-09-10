@@ -75,10 +75,13 @@ def _valid_count_at(per_probe, active, ts, threshold_minutes):
 
 
 def _first_met(series, temp_min, temp_max, hold_minutes,
-               insufficient_moments=()):
-    """按连续在窗口口径扫描：累计首次达到 hold_minutes 的时刻。
+               insufficient_moments=(), gap_threshold_minutes=10):
+    """按连续在窗口口径扫描：最后一次缺报之后的连续段首次累计达标时刻。
 
-    与 cure.evaluate 同一保守规则：相邻两点都在窗口内，该区间才计入。
+    与 cure.evaluate 同一保守规则：
+    - 相邻两点都在窗口内，该区间才计入；
+    - 相邻两点间隔超过缺报阈值 → PROBE_GAP，中间温度无法验证：
+      该区间不计入，且**清零此前累计**，读数恢复后从重新验证的连续段重新累计。
     区间末端落在 insufficient_moments 中（该时刻有效探头不足）时，
     该时刻不能确认达标。返回 (首次达标时刻 datetime|None, 精确累计分钟)。
     """
@@ -88,6 +91,10 @@ def _first_met(series, temp_min, temp_max, hold_minutes,
     for (t0, v0), (t1, v1) in zip(series, series[1:]):
         dt = (t1 - t0).total_seconds() / 60.0
         if dt <= 0:
+            continue
+        if dt > gap_threshold_minutes:
+            # 内部缺报切断连续保温：缺报前累计作废，从恢复后的连续段重算
+            acc = 0.0
             continue
         if temp_min <= v0 <= temp_max and temp_min <= v1 <= temp_max:
             before = acc
@@ -134,7 +141,8 @@ def project_item(readings, probe_cfg, temp_min, temp_max, hold_minutes,
             insufficient_moments.add(ts)
 
     first_met, acc_exact = _first_met(series, temp_min, temp_max, hold_minutes,
-                                      insufficient_moments)
+                                      insufficient_moments,
+                                      gap_threshold_minutes)
     # 达标确认还要求该时刻读数不超时（其后长时间无读数时，达标时刻本身仍有效；
     # 但若达标判定依赖的最后读数距离 as_of 超时，则当前不能视为在保条件）
     alerts = _alerts(analysis, series, temp_min, temp_max, as_of,

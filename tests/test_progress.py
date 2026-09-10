@@ -344,6 +344,94 @@ class ProgressTest(unittest.TestCase):
         self.assertEqual(prog["planned_unload_early_minutes"], 0.0)
 
     # ---------------------------------------------------------- 5. as_of 截断
+    def test_internal_gap_cuts_continuous_hold_and_recovery_restarts(self):
+        """内部缺报切断连续保温：08:00 与 08:30 两条合格读数不得算 30 分钟。
+
+        回归：判定序列两点间隔 30 分钟 > 缺报阈值 10 时，系统曾记录
+        PROBE_GAP 却仍按在窗区间插值出 08:20 达标（ALL_MET，
+        safe_unload_at 早于第二条读数）。修正后该区间不累计、连续段清零，
+        读数恢复后只从重新验证的连续段累计；缺报告警保留。
+        """
+        bid, _ = self._trial([
+            {"workpiece_id": "W-1", "order_id": "O", "length_mm": 500,
+             "width_mm": 400, "height_mm": 300, "weight_kg": 10,
+             "powder_batch": "P1", "compat_group": None, "due_at": None}],
+            hold=20)
+        self._load(bid)
+        # 缺报前后各一条合格读数（间隔 30 分钟）
+        self._post(bid, [
+            {"workpiece_id": "W-1", "ts": "2026-09-10T08:00:00",
+             "metal_temp_c": 175},
+            {"workpiece_id": "W-1", "ts": "2026-09-10T08:30:00",
+             "metal_temp_c": 175},
+        ])
+        prog = self._progress(bid, "2026-09-10T08:30:00")
+        it = self._item(prog, "W-1")
+        # 缺报区间不可计入保温：累计 0、剩余 20，不得插值出 08:20 达标
+        self.assertEqual(it["in_window_minutes"], 0.0)
+        self.assertEqual(it["remaining_hold_minutes"], 20.0)
+        self.assertIsNone(it["first_met_at"])
+        self.assertEqual(it["status"], "TRACKING")
+        # 安全出炉 = 第二条读数（08:30，重新验证的起点）+ 剩余 20 = 08:50，
+        # 绝不早于 08:30
+        self.assertEqual(it["safe_unload_at"], "2026-09-10T08:50:00")
+        self.assertGreaterEqual(it["safe_unload_at"], it["latest_reading_at"])
+        # PROBE_GAP 告警保留
+        self.assertIn("PROBE_GAP", {a["code"] for a in it["alerts"]})
+        # 炉次级同步：可预测但安全出炉为 08:50（计划 08:56:27 前仍需继续保温）
+        self.assertEqual(prog["prediction_status"], "PREDICTABLE")
+        self.assertEqual(prog["safe_unload_at"], "2026-09-10T08:50:00")
+
+        # 读数恢复：08:35/08:40/08:45/08:50 连续在窗（轻微波动避免卡值），
+        # 仅从最后一次缺报（08:30）之后的连续段重新累计
+        self._post(bid, [
+            {"workpiece_id": "W-1", "ts": "2026-09-10T08:35:00",
+             "metal_temp_c": 174},
+            {"workpiece_id": "W-1", "ts": "2026-09-10T08:40:00",
+             "metal_temp_c": 175},
+            {"workpiece_id": "W-1", "ts": "2026-09-10T08:45:00",
+             "metal_temp_c": 176},
+            {"workpiece_id": "W-1", "ts": "2026-09-10T08:50:00",
+             "metal_temp_c": 175},
+        ])
+        prog2 = self._progress(bid, "2026-09-10T08:50:00")
+        it2 = self._item(prog2, "W-1")
+        # 08:30-08:50 四段 5 分钟 = 20 分钟（缺报前的 0 分钟未带回）
+        self.assertEqual(it2["in_window_minutes"], 20.0)
+        self.assertEqual(it2["remaining_hold_minutes"], 0.0)
+        self.assertEqual(it2["status"], "MET")
+        self.assertEqual(it2["first_met_at"], "2026-09-10T08:50:00")
+        self.assertEqual(it2["safe_unload_at"], "2026-09-10T08:50:00")
+        # 缺报告警依旧保留备查
+        self.assertIn("PROBE_GAP", {a["code"] for a in it2["alerts"]})
+        self.assertEqual(prog2["prediction_status"], "ALL_MET")
+        self.assertEqual(prog2["safe_unload_at"], "2026-09-10T08:50:00")
+
+    def test_internal_gap_unload_verdict_uses_restarted_minutes(self):
+        """出炉判定口径同样在内部缺报处切断：30 分钟空窗不得算满保温。"""
+        bid, _ = self._trial([
+            {"workpiece_id": "W-1", "order_id": "O", "length_mm": 500,
+             "width_mm": 400, "height_mm": 300, "weight_kg": 10,
+             "powder_batch": "P1", "compat_group": None, "due_at": None}],
+            hold=20)
+        self._load(bid)
+        self._post(bid, [
+            {"workpiece_id": "W-1", "ts": "2026-09-10T08:00:00",
+             "metal_temp_c": 175},
+            {"workpiece_id": "W-1", "ts": "2026-09-10T08:30:00",
+             "metal_temp_c": 175},
+        ])
+        r = self.c.post(f"/api/batches/{bid}/unload",
+                        json={"at": "2026-09-10T08:30:00"})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        res = r.get_json()["results"][0]
+        self.assertEqual(res["verdict"], "NOT_OK")
+        self.assertIn("UNDER_TIME", res["flags"])
+        self.assertIn("PROBE_GAP", res["flags"])
+        self.assertEqual(res["cure"]["in_window_minutes"], 0.0)
+        self.assertEqual(res["cure"]["remaining_minutes"], 20.0)
+
+    # ---------------------------------------------------------- 5. as_of 截断
     def test_as_of_truncates_readings(self):
         bid, _ = self._trial([
             {"workpiece_id": "W-1", "order_id": "O", "length_mm": 500,
