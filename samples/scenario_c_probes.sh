@@ -79,6 +79,9 @@ echo "== 4b. 原样重传（幂等去重，duplicates 应等于条数） =="
 curl -sS -X POST "$BASE/batches/$BID/readings" -H 'Content-Type: application/json' \
   --data @/tmp/readings_c.json | pp
 
+echo "== 4c. 在炉进度与安全出炉预测（基准 08:45；W-3001 被 T2 拖累应 BLOCKED） =="
+curl -sS "$BASE/batches/$BID/progress?as_of=2026-09-10T08:45:00" | pp
+
 echo "== 5. 炉次详情：W-3001 被 T2 低温拖累欠时，T2 卡值区间可见 =="
 curl -sS "$BASE/batches/$BID" | pp
 

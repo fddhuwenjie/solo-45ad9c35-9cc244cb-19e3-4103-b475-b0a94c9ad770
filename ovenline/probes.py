@@ -17,18 +17,16 @@ from datetime import timedelta
 from . import cure
 
 
-def analyze(readings, probe_cfg, temp_min, temp_max, hold_minutes,
-            gap_threshold_minutes=10, divergence_c=5.0,
-            stuck_min_consecutive=5, min_valid_probes=1):
-    """综合评估单件工件在某炉次内的多探头测温。
+def split_channels(readings, probe_cfg):
+    """把原始读数按探头通道拆分为校正后序列（analyze 的纯数据部分）。
 
-    readings:  [(ts datetime, probe_id|None, 原始温度℃)]，顺序不限；
-               probe_id 为 None 表示未登记探头工件的隐式单通道读数
+    readings:  [(ts datetime, probe_id|None, 原始温度℃)]
     probe_cfg: {probe_id: {"offset_c": float, "status": "ACTIVE"/"DISABLED"}}
-               签发快照或当前主数据；空 dict 表示该工件未登记探头
-    返回: 固化判定 dict（cure.evaluate 字段 + 判定序列/探头状态/异常区间）
+    返回 (channels, per_probe, active)：
+      channels  = {probe_id: {"offset_c", "status"}}（含隐式单通道 None）
+      per_probe = {probe_id: [(ts, 校正温度), ...]}（已按时间排序）
+      active    = 状态为 ACTIVE 的探头编号列表
     """
-    # 校正温度按探头通道归集
     channels = {pid: {"offset_c": float(c["offset_c"]), "status": c["status"]}
                 for pid, c in probe_cfg.items()}
     per_probe = {pid: [] for pid in channels}
@@ -42,8 +40,26 @@ def analyze(readings, probe_cfg, temp_min, temp_max, hold_minutes,
         # 未绑定探头的读数在入库前已被拒收；此处防御性忽略
     for pts in per_probe.values():
         pts.sort(key=lambda p: p[0])
-
     active = [pid for pid, c in channels.items() if c["status"] == "ACTIVE"]
+    return channels, per_probe, active
+
+
+def analyze(readings, probe_cfg, temp_min, temp_max, hold_minutes,
+            gap_threshold_minutes=10, divergence_c=5.0,
+            stuck_min_consecutive=5, min_valid_probes=1, window_end=None):
+    """综合评估单件工件在某炉次内的多探头测温。
+
+    readings:  [(ts datetime, probe_id|None, 原始温度℃)]，顺序不限；
+               probe_id 为 None 表示未登记探头工件的隐式单通道读数
+    probe_cfg: {probe_id: {"offset_c": float, "status": "ACTIVE"/"DISABLED"}}
+               签发快照或当前主数据；空 dict 表示该工件未登记探头
+    window_end: 进度查询的计算基准时刻：缺报测量窗口末端取该时刻
+               （尾随缺报据此判定，探头有效性随之变化）；
+               None 时窗口末端取全体启用探头的最晚读数（出炉判定口径）
+    返回: 固化判定 dict（cure.evaluate 字段 + 判定序列/探头状态/异常区间）
+    """
+    # 校正温度按探头通道归集
+    channels, per_probe, active = split_channels(readings, probe_cfg)
 
     # 判定序列：每个采样时刻取有效探头校正温度的最低值
     lowest = {}
@@ -58,7 +74,8 @@ def analyze(readings, probe_cfg, temp_min, temp_max, hold_minutes,
 
     # 缺报检测：按每个启用探头自身的时间序列识别长时间缺报；
     # 超过缺报阈值的探头不再计为有效
-    gaps, valid_count = _probe_gaps(per_probe, active, gap_threshold_minutes)
+    gaps, valid_count = _probe_gaps(per_probe, active, gap_threshold_minutes,
+                                    window_end=window_end)
 
     # 卡值检测：逐探头（含已停用，保留其异常区间备查）
     probes_out = []
@@ -89,10 +106,12 @@ def analyze(readings, probe_cfg, temp_min, temp_max, hold_minutes,
     }
 
 
-def _probe_gaps(per_probe, active, threshold_minutes):
+def _probe_gaps(per_probe, active, threshold_minutes, window_end=None):
     """按每个启用探头的时间序列识别长时间缺报。
 
-    测量窗口取全体启用探头读数的最早/最晚时刻。对每个启用探头：
+    测量窗口起点取全体启用探头读数的最早时刻；末端取 window_end
+    （进度查询的计算基准时刻 as_of），未提供时退化为最晚读数时刻
+    （出炉判定口径）。对每个启用探头：
     首读数前的起始缺报、相邻读数间断、末读数后的尾随缺报，超过阈值即记录；
     全程无读数的启用探头按整个测量窗口记一段缺报。
 
@@ -101,7 +120,8 @@ def _probe_gaps(per_probe, active, threshold_minutes):
     all_ts = [ts for pid in active for ts, _ in per_probe.get(pid, [])]
     if not all_ts:
         return [], 0
-    start, end = min(all_ts), max(all_ts)
+    start = min(all_ts)
+    end = window_end if window_end is not None else max(all_ts)
     thr = timedelta(minutes=threshold_minutes)
     gaps = []
     valid = 0

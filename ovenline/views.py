@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 
 from flask import Blueprint, Response, current_app, jsonify, request
 
-from . import probes, scheduler
+from . import probes, progress, scheduler
 from .db import get_db
 
 bp = Blueprint("api", __name__)
@@ -90,11 +90,14 @@ def _probe_cfg_for_item(db, batch_id, workpiece_id, frozen):
     return {r["probe_id"]: dict(r) for r in rows}
 
 
-def _cure_for_item(db, b, workpiece_id):
+def _cure_for_item(db, b, workpiece_id, as_of=None):
     """按工件固化窗口评估。已签发炉次用签发快照，草稿用当前主数据。
 
     多探头：校正温度 = 原始值 + 冻结的校准偏移；判定序列取每个采样时刻
     有效探头校正温度的最低值，据此累计固化窗口分钟。
+    as_of 不为 None 时：只采用 ts <= as_of 的读数，且缺报测量窗口末端
+    取 as_of（用于在炉进度预测）；为 None 时按全体读数与最晚读数时刻
+    评估（出炉判定口径）。
     """
     bid = b["id"]
     row = db.execute(
@@ -107,11 +110,18 @@ def _cure_for_item(db, b, workpiece_id):
         " WHERE bi.batch_id=? AND bi.workpiece_id=?",
         (bid, workpiece_id),
     ).fetchone()
-    rows = db.execute(
-        "SELECT ts, probe_id, metal_temp_c FROM readings"
-        " WHERE batch_id=? AND workpiece_id=? ORDER BY ts, id",
-        (bid, workpiece_id),
-    ).fetchall()
+    if as_of is None:
+        rows = db.execute(
+            "SELECT ts, probe_id, metal_temp_c FROM readings"
+            " WHERE batch_id=? AND workpiece_id=? ORDER BY ts, id",
+            (bid, workpiece_id),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT ts, probe_id, metal_temp_c FROM readings"
+            " WHERE batch_id=? AND workpiece_id=? AND ts <= ? ORDER BY ts, id",
+            (bid, workpiece_id, as_of.isoformat()),
+        ).fetchall()
     cfg = _probe_cfg_for_item(db, bid, workpiece_id,
                               frozen=b["state"] not in ("DRAFT", "SUPERSEDED"))
     pts = [(datetime.fromisoformat(r["ts"]), r["probe_id"], r["metal_temp_c"])
@@ -127,6 +137,7 @@ def _cure_for_item(db, b, workpiece_id):
         current_app.config["PROBE_DIVERGENCE_C"],
         current_app.config["STUCK_PROBE_MIN_CONSECUTIVE"],
         current_app.config["MIN_VALID_PROBES"],
+        window_end=as_of,
     )
     # 补充停用原因/时刻（快照中的处置信息）
     for p in result["probes"]:
@@ -154,7 +165,75 @@ def _cure_summary(c):
     }
 
 
-def _batch_payload(db, b):
+def _item_window(db, batch_id, workpiece_id):
+    """工件在该炉次的固化窗口与保温要求（已签发取快照，草稿取当前主数据）。"""
+    r = db.execute(
+        "SELECT COALESCE(bi.snap_temp_min_c, p.temp_min_c) AS temp_min_c,"
+        " COALESCE(bi.snap_temp_max_c, p.temp_max_c) AS temp_max_c,"
+        " COALESCE(bi.snap_hold_minutes, p.hold_minutes) AS hold_minutes"
+        " FROM batch_items bi JOIN workpieces w ON w.id = bi.workpiece_id"
+        " LEFT JOIN powders p ON p.batch_no = w.powder_batch"
+        " WHERE bi.batch_id=? AND bi.workpiece_id=?",
+        (batch_id, workpiece_id)).fetchone()
+    return r["temp_min_c"], r["temp_max_c"], r["hold_minutes"]
+
+
+def _resolve_as_of(b, requested, now=None):
+    """解析进度计算基准时刻。
+
+    显式传入的 as_of 原样采用（允许历史复盘）；未传入时：
+    在炉炉次取当前时刻；已出炉炉次取实际出炉时刻（出炉后的快照不再随时间漂移）；
+    其他状态取当前时刻。
+    返回 (as_of datetime, source)。
+    """
+    now = now or _now()
+    if requested is not None:
+        return requested, "query"
+    if b["state"] in ("UNLOADED", "CLOSED") and b["actual_unload_at"]:
+        return datetime.fromisoformat(b["actual_unload_at"]), "actual_unload_at"
+    return now, "now"
+
+
+def _batch_progress(db, b, as_of, basis_source, computed_at=None):
+    """构建炉次级在炉固化进度与安全出炉预测（逐件 project_item + 汇总）。
+
+    读数按 as_of 截断，签发快照窗口/探头配置，缺报窗口末端取 as_of。
+    计划出炉时刻取签发时冻结的 planned_unload_at，本计算不改写它。
+    """
+    cfg_gap = current_app.config["PROBE_GAP_MINUTES"]
+    item_rows = db.execute(
+        "SELECT workpiece_id FROM batch_items WHERE batch_id=? ORDER BY hanger_slot",
+        (b["id"],)).fetchall()
+    items = []
+    for r in item_rows:
+        wid = r["workpiece_id"]
+        wmin, wmax, hold = _item_window(db, b["id"], wid)
+        rows = db.execute(
+            "SELECT ts, probe_id, metal_temp_c FROM readings"
+            " WHERE batch_id=? AND workpiece_id=? AND ts <= ? ORDER BY ts, id",
+            (b["id"], wid, as_of.isoformat())).fetchall()
+        pts = [(datetime.fromisoformat(r["ts"]), r["probe_id"], r["metal_temp_c"])
+               for r in rows]
+        cfg = _probe_cfg_for_item(
+            db, b["id"], wid,
+            frozen=b["state"] not in ("DRAFT", "SUPERSEDED"))
+        item = {"workpiece_id": wid,
+                **progress.project_item(
+                    pts,
+                    {pid: {"offset_c": c["offset_c"], "status": c["status"]}
+                     for pid, c in cfg.items()},
+                    wmin, wmax, hold, as_of, cfg_gap,
+                    current_app.config["PROBE_DIVERGENCE_C"],
+                    current_app.config["STUCK_PROBE_MIN_CONSECUTIVE"],
+                    current_app.config["MIN_VALID_PROBES"])}
+        items.append(item)
+    planned = (datetime.fromisoformat(b["planned_unload_at"])
+               if b["planned_unload_at"] else None)
+    return progress.summarize(items, planned, as_of,
+                              computed_at or _now(), basis_source)
+
+
+def _batch_payload(db, b, as_of=None, as_of_source=None):
     items = db.execute(
         "SELECT bi.workpiece_id, bi.hanger_slot, bi.slots_used, w.order_id,"
         " COALESCE(bi.snap_length_mm, w.length_mm) AS length_mm,"
@@ -198,6 +277,8 @@ def _batch_payload(db, b):
             "flags": flags,
             "probe_actions": probe_actions,
         })
+    resolved_as_of, default_source = _resolve_as_of(b, as_of)
+    basis_source = as_of_source if as_of is not None else default_source
     return {
         "batch_id": b["id"],
         "version_id": b["version_id"],
@@ -218,6 +299,8 @@ def _batch_payload(db, b):
         "actual": {"load_at": b["actual_load_at"], "unload_at": b["actual_unload_at"]},
         "created_at": b["created_at"],
         "items": out_items,
+        # 同一进度快照贯穿炉次详情 / JSON 档案 / 随炉卡
+        "progress": _batch_progress(db, b, resolved_as_of, basis_source),
     }
 
 
@@ -571,8 +654,12 @@ def add_readings(bid):
         else:
             duplicates += 1  # 同 (炉次, 工件, 探头, 时刻) 重复回传，幂等忽略
     db.commit()
+    # 接受新读数后即时重算在炉进度（重复回传也返回当前进度；不改写签发计划）
+    now = _now()
     return jsonify({"batch_id": bid, "accepted": accepted,
-                    "duplicates": duplicates, "rejected": rejected})
+                    "duplicates": duplicates, "rejected": rejected,
+                    "progress": _batch_progress(db, b, now, "now",
+                                                computed_at=now)})
 
 
 @bp.post("/batches/<int:bid>/unload")
@@ -776,12 +863,15 @@ def disable_probe(bid, wid, pid):
          json.dumps(_cure_summary(after), ensure_ascii=False),
          _now().isoformat()))
     db.commit()
+    now = _now()
     return jsonify({
         "batch_id": bid, "workpiece_id": wid, "probe_id": pid,
         "status": "DISABLED", "reason": reason,
         "recalc": {"before": _cure_summary(before),
                    "after": _cure_summary(after)},
         "cure": after,
+        # 停用探头后即时重算在炉进度（只重算该工件，不改写已签发计划）
+        "progress": _batch_progress(db, b, now, "now", computed_at=now),
     })
 
 
@@ -848,7 +938,38 @@ def batch_detail(bid):
     b = _fetch_batch(db, bid)
     if b is None:
         return _err(404, f"炉次 {bid} 不存在")
-    return jsonify(_batch_payload(db, b))
+    try:
+        as_of = _parse_dt(request.args["as_of"], "as_of") \
+            if request.args.get("as_of") else None
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify(_batch_payload(db, b, as_of=as_of, as_of_source="query"))
+
+
+@bp.get("/batches/<int:bid>/progress")
+def batch_progress(bid):
+    """在炉固化进度与安全出炉预测。
+
+    查询参数 as_of：计算基准时刻（ISO），缺省取当前时刻（已出炉炉次取
+    实际出炉时刻）。逐件返回最新有效测温时刻、最低校正温度、已累计/剩余
+    保温分钟、读数新鲜度与阻塞原因；炉次级取最晚安全出炉时刻，
+    并指出计划出炉过早的分钟数。本接口为只读预测，不改写已签发计划。
+    """
+    db = get_db()
+    b = _fetch_batch(db, bid)
+    if b is None:
+        return _err(404, f"炉次 {bid} 不存在")
+    try:
+        as_of = _parse_dt(request.args["as_of"], "as_of") \
+            if request.args.get("as_of") else None
+    except ValueError as e:
+        return _err(400, str(e))
+    resolved, source = _resolve_as_of(b, as_of)
+    return jsonify({
+        "batch_id": bid,
+        "state": b["state"],
+        "progress": _batch_progress(db, b, resolved, source),
+    })
 
 
 @bp.get("/workpieces/<wid>")
@@ -887,7 +1008,12 @@ def batch_archive(bid):
     b = _fetch_batch(db, bid)
     if b is None:
         return _err(404, f"炉次 {bid} 不存在")
-    payload = _batch_payload(db, b)
+    try:
+        as_of = _parse_dt(request.args["as_of"], "as_of") \
+            if request.args.get("as_of") else None
+    except ValueError as e:
+        return _err(400, str(e))
+    payload = _batch_payload(db, b, as_of=as_of, as_of_source="query")
     payload["exported_at"] = _now().isoformat()
     body = json.dumps(payload, ensure_ascii=False, indent=2)
     return Response(
@@ -904,7 +1030,12 @@ def batch_card(bid):
     b = _fetch_batch(db, bid)
     if b is None:
         return _err(404, f"炉次 {bid} 不存在")
-    p = _batch_payload(db, b)
+    try:
+        as_of = _parse_dt(request.args["as_of"], "as_of") \
+            if request.args.get("as_of") else None
+    except ValueError as e:
+        return _err(400, str(e))
+    p = _batch_payload(db, b, as_of=as_of, as_of_source="query")
     rows = []
     for it in p["items"]:
         flag_txt = "、".join(f["code"] for f in it["flags"]) or "-"
@@ -961,6 +1092,48 @@ def batch_card(bid):
             f"<p class='small'>缺报区间：{gaps}</p>"
             f"<p class='small'>判定序列（各时刻有效探头最低校正温度）：{series}</p>"
         )
+    # 在炉固化进度与安全出炉预测（与炉次详情/JSON 档案同一进度快照）
+    prog = p.get("progress") or {}
+    basis = prog.get("basis", {})
+    source_text = {"query": "查询指定", "now": "查询时刻",
+                   "actual_unload_at": "实际出炉时刻"}.get(basis.get("source"),
+                                                           basis.get("source", ""))
+    prog_rows = []
+    for it in prog.get("items", []):
+        blockers = "；".join(
+            f"[{x['code']}] {html.escape(x['message'])}"
+            for x in it["blockers"]) or "-"
+        alerts = "；".join(
+            f"[{x['code']}] {html.escape(x['message'])}"
+            for x in it["alerts"]) or "-"
+        freshness = ("-" if it["reading_freshness_minutes"] is None
+                     else f"{it['reading_freshness_minutes']:g} 分钟"
+                          + ("（缺报）" if it["stale"] else ""))
+        latest_temp = "-" if it["latest_temp_c"] is None \
+            else f"{it['latest_temp_c']:g}"
+        safe = it["safe_unload_at"] or "不可预测"
+        met = it["first_met_at"] or "-"
+        prog_rows.append(
+            "<tr>"
+            f"<td>{html.escape(it['workpiece_id'])}</td>"
+            f"<td>{html.escape(it['status_text'])}（{it['status']}）</td>"
+            f"<td>{it['latest_reading_at'] or '-'}</td>"
+            f"<td>{latest_temp}</td>"
+            f"<td>{freshness}</td>"
+            f"<td>{it['in_window_minutes']:g} / {it['window']['hold_minutes']:g}</td>"
+            f"<td>{it['remaining_hold_minutes']:g}</td>"
+            f"<td>{met}</td>"
+            f"<td>{html.escape(safe)}</td>"
+            f"<td>{blockers}</td>"
+            f"<td>{alerts}</td>"
+            "</tr>"
+        )
+    plan_text = {
+        "OK": "计划出炉时刻不早于预测安全出炉时刻，计划有效",
+        "TOO_EARLY": f"计划出炉过早 {prog.get('planned_unload_early_minutes', 0):g} 分钟，"
+                     "计划出炉时刻已失效，应按预测安全出炉时刻延后",
+        "CANNOT_VERIFY": "存在不可预测工件，无法判定计划出炉时刻是否有效",
+    }.get(prog.get("plan_status"), "-")
     html_doc = f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <title>随炉卡 · 炉次 {p['batch_id']}</title>
@@ -994,6 +1167,21 @@ p.small {{ font-size: 12px; margin: 4px 0; }}
 <tr><th>工件</th><th>订单</th><th>粉料</th><th>尺寸 mm</th><th>重量 kg</th>
     <th>挂位</th><th>交期</th><th>在区/要求 min</th><th>标记</th></tr>
 {''.join(rows)}
+</table>
+<h2>在炉固化进度与安全出炉预测</h2>
+<table class="meta">
+<tr><td>计算基准时刻：{html.escape(str(basis.get('as_of') or '-'))}（{source_text}）</td>
+    <td>预测状态：{html.escape(prog.get('prediction_status_text', '-'))}
+        （{html.escape(str(prog.get('prediction_status', '-')))}）</td></tr>
+<tr><td>预测安全出炉：{html.escape(str(prog.get('safe_unload_at') or '不可预测'))}</td>
+    <td>计划出炉：{html.escape(str(prog.get('planned_unload_at') or '-'))}</td></tr>
+<tr><td colspan="2">计划校验：{html.escape(plan_text)}</td></tr>
+</table>
+<table>
+<tr><th>工件</th><th>状态</th><th>最新测温</th><th>最新最低校正 ℃</th>
+    <th>读数新鲜度</th><th>累计/要求 min</th><th>剩余 min</th>
+    <th>首次达标</th><th>预测安全出炉</th><th>阻塞原因</th><th>告警</th></tr>
+{''.join(prog_rows)}
 </table>
 <h2>探头与判定序列</h2>
 {''.join(probe_blocks)}

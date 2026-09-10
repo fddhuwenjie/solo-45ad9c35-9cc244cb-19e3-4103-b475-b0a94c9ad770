@@ -38,6 +38,7 @@ ovenline/
   scheduler.py             排产引擎（纯函数）
   cure.py                  固化判定（纯函数）
   probes.py                多探头判定：校正/判定序列/异常检测（纯函数）
+  progress.py              在炉进度与安全出炉预测（纯函数，基于 probes.analyze）
   views.py                 REST 路由与状态机
 samples/
   scenario_a_normal.sh             样例一：正常闭环
@@ -101,6 +102,35 @@ samples/
 - 炉内出现禁配组同炉 → `INCOMPAT_CONFLICT` 禁配冲突；
 - 无任何标记 → 工件 `DONE`；否则 `REWORK_PENDING` 待返工。
 
+### 在炉固化进度与安全出炉预测（只读，不改写签发计划）
+炉次运行中可随时查询进度：`GET /api/batches/<id>/progress?as_of=<ISO>`，
+`as_of` 为计算基准时刻（缺省：在炉取当前时刻、已出炉取实际出炉时刻）。
+炉次详情、JSON 档案、随炉卡均携带**同一进度快照**并注明基准时刻与来源。
+逐件返回：
+- `latest_reading_at` 最新有效测温时刻、`latest_temp_c` 当前最低校正温度
+  （各有效探头校正温度的最低值）、`reading_freshness_minutes` 读数新鲜度
+  （距基准时刻分钟数，超过缺报阈值 → `stale`）；
+- `in_window_minutes` 已累计保温分钟、`remaining_hold_minutes` 剩余分钟；
+- `first_met_at` 首次达标时刻、`safe_unload_at` 最早安全出炉时刻；
+- `status`：`MET` 已达标 / `TRACKING` 保温中可预测 / `BLOCKED` 不可预测，
+  `blockers` 阻塞原因、`alerts` 告警（卡值/温差/缺报/历史超温等，达标后保留）。
+
+预测口径：
+- **仅当最新最低校正温度位于许可区间、有效探头数量达标且读数未超时**，
+  才按连续保温外推：安全出炉 = 最新测温时刻 + 剩余保温分钟；
+- 其他情形标记 `BLOCKED`，阻塞原因可为 `UNDER_TEMP`（最新欠温）、
+  `OVER_TEMP`（最新超温）、`STALE_READING`（超时缺报）、
+  `INSUFFICIENT_PROBES`（有效探头不足）、`NO_READING`（基准时刻前无读数），
+  可同时多个；历史上曾超温但最新已恢复时只给 `OVER_TEMP_HISTORY` 告警；
+- **首次达标**只在「探头充足、读数新鲜」的采样时刻确认；一旦确认永久保留，
+  其后的欠温/超温/缺报等异常读数**不回退达标状态**，只保留告警；
+- 炉次级 `safe_unload_at` 取**所有工件最晚**的可出炉时刻（有不可预测
+  工件时不给整体时刻）；与签发的计划出炉时刻比较：`plan_status` 为
+  `OK` / `TOO_EARLY`（`planned_unload_early_minutes` 给出早了多少分钟，
+  说明计划出炉时刻已失效）/ `CANNOT_VERIFY`（有不可预测工件）。
+- 每次**接受新读数**或**停用探头**后即时重算（读数/停用响应中直接带
+  `progress`）；预测为只读计算，**不改写已签发计划**，也不落任何标记。
+
 ### 状态机（越序一律 409）
 ```
 炉次：DRAFT --签发--> ISSUED --入炉--> IN_OVEN --出炉判定--> UNLOADED --结案--> CLOSED
@@ -124,7 +154,8 @@ samples/
 | POST | `/schedule/trial` | 试算：排出炉次/挂位/升温/保温/出炉时刻，形成关联版本 |
 | POST | `/batches/<id>/issue` | 签发（DRAFT→ISSUED，冻结工件/粉料/探头快照） |
 | POST | `/batches/<id>/load` | 入炉（ISSUED→IN_OVEN），body 可带 `at` |
-| POST | `/batches/<id>/readings` | 测温回传（仅 IN_OVEN），`readings:[{workpiece_id,probe_id,ts,metal_temp_c}]` |
+| POST | `/batches/<id>/readings` | 测温回传（仅 IN_OVEN），`readings:[{workpiece_id,probe_id,ts,metal_temp_c}]`，接受后即时重算进度 |
+| GET  | `/batches/<id>/progress` | 在炉固化进度与安全出炉预测（可带 `?as_of=` 计算基准，逐件状态/阻塞/告警，炉次级最晚安全出炉与计划过早分钟） |
 | POST | `/batches/<id>/unload` | 出炉判定（IN_OVEN→UNLOADED），逐件给 verdict 与标记 |
 | POST | `/batches/<id>/close` | 炉次结案（存在未了结工件时 409 并列出） |
 | POST | `/workpieces/<id>/probes` | 登记/更新工件探头及校准偏移（签发时冻结快照） |
