@@ -1,0 +1,130 @@
+{
+  "batch_id": 1,
+  "version_id": 1,
+  "oven_id": "OVEN-1",
+  "state": "CLOSED",
+  "window": {
+    "min_c": 175.0,
+    "max_c": 190.0,
+    "hold_minutes": 25.0
+  },
+  "total_weight_kg": 57.0,
+  "heatup_minutes": 40.52,
+  "planned": {
+    "load_at": "2026-09-10T08:00:00",
+    "cure_start_at": "2026-09-10T08:40:30",
+    "unload_at": "2026-09-10T09:05:30"
+  },
+  "actual": {
+    "load_at": "2026-09-10T08:00:00",
+    "unload_at": "2026-09-10T09:10:00"
+  },
+  "created_at": "2026-09-10T15:31:02",
+  "items": [
+    {
+      "workpiece_id": "W-1001",
+      "hanger_slot": 1,
+      "slots_used": 2,
+      "order_id": "PO-01",
+      "length_mm": 800.0,
+      "width_mm": 400.0,
+      "height_mm": 300.0,
+      "weight_kg": 12.0,
+      "powder_batch": "P-RED",
+      "compat_group": "G1",
+      "due_at": "2026-09-10T14:00:00",
+      "is_rework": false,
+      "status": "CLOSED",
+      "cure": {
+        "reading_count": 15,
+        "in_window_minutes": 40.0,
+        "required_hold_minutes": 20.0,
+        "remaining_minutes": 0.0,
+        "under_time": false,
+        "over_temp": false,
+        "max_temp_c": 184.0,
+        "probe_gaps": []
+      },
+      "flags": []
+    },
+    {
+      "workpiece_id": "W-1002",
+      "hanger_slot": 3,
+      "slots_used": 2,
+      "order_id": "PO-01",
+      "length_mm": 700.0,
+      "width_mm": 400.0,
+      "height_mm": 300.0,
+      "weight_kg": 10.0,
+      "powder_batch": "P-BLUE",
+      "compat_group": "G1",
+      "due_at": "2026-09-10T14:00:00",
+      "is_rework": false,
+      "status": "CLOSED",
+      "cure": {
+        "reading_count": 15,
+        "in_window_minutes": 40.0,
+        "required_hold_minutes": 25.0,
+        "remaining_minutes": 0.0,
+        "under_time": false,
+        "over_temp": false,
+        "max_temp_c": 184.0,
+        "probe_gaps": []
+      },
+      "flags": []
+    },
+    {
+      "workpiece_id": "W-1003",
+      "hanger_slot": 5,
+      "slots_used": 2,
+      "order_id": "PO-02",
+      "length_mm": 900.0,
+      "width_mm": 500.0,
+      "height_mm": 400.0,
+      "weight_kg": 20.0,
+      "powder_batch": "P-RED",
+      "compat_group": "G2",
+      "due_at": "2026-09-10T16:00:00",
+      "is_rework": false,
+      "status": "CLOSED",
+      "cure": {
+        "reading_count": 15,
+        "in_window_minutes": 40.0,
+        "required_hold_minutes": 20.0,
+        "remaining_minutes": 0.0,
+        "under_time": false,
+        "over_temp": false,
+        "max_temp_c": 184.0,
+        "probe_gaps": []
+      },
+      "flags": []
+    },
+    {
+      "workpiece_id": "W-1004",
+      "hanger_slot": 7,
+      "slots_used": 2,
+      "order_id": "PO-02",
+      "length_mm": 600.0,
+      "width_mm": 500.0,
+      "height_mm": 400.0,
+      "weight_kg": 15.0,
+      "powder_batch": "P-BLUE",
+      "compat_group": "G2",
+      "due_at": "2026-09-10T16:00:00",
+      "is_rework": false,
+      "status": "CLOSED",
+      "cure": {
+        "reading_count": 15,
+        "in_window_minutes": 40.0,
+        "required_hold_minutes": 25.0,
+        "remaining_minutes": 0.0,
+        "under_time": false,
+        "over_temp": false,
+        "max_temp_c": 184.0,
+        "probe_gaps": []
+      },
+      "flags": []
+    }
+  ],
+  "exported_at": "2026-09-10T15:31:03"
+}
