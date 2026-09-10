@@ -6,9 +6,13 @@
   固化窗口分钟数按该序列累计，各探头原始值仍完整保留在 readings 表；
 - 异常检测：同一探头连续相同读数（STUCK_PROBE 卡值）、
   同一时刻有效探头间温差超阈值（PROBE_DIVERGENCE）、
-  判定序列相邻点间隔超阈值（PROBE_GAP，由 cure.evaluate 给出）。
+  每个启用探头自身时间序列的长时间缺报（PROBE_GAP）；
+- 有效探头：未停用、有读数、且末读数距测量窗口末端未超过缺报阈值；
+  超过缺报阈值的探头不再计为有效，有效探头不足时不得判定合格。
 """
 from __future__ import annotations
+
+from datetime import timedelta
 
 from . import cure
 
@@ -52,6 +56,10 @@ def analyze(readings, probe_cfg, temp_min, temp_max, hold_minutes,
     base = cure.evaluate(series, temp_min, temp_max, hold_minutes,
                          gap_threshold_minutes)
 
+    # 缺报检测：按每个启用探头自身的时间序列识别长时间缺报；
+    # 超过缺报阈值的探头不再计为有效
+    gaps, valid_count = _probe_gaps(per_probe, active, gap_threshold_minutes)
+
     # 卡值检测：逐探头（含已停用，保留其异常区间备查）
     probes_out = []
     for pid, ch in channels.items():
@@ -67,10 +75,9 @@ def analyze(readings, probe_cfg, temp_min, temp_max, hold_minutes,
                                      ch["status"]),
         })
 
-    valid_count = sum(1 for pid in active if per_probe.get(pid))
-
     return {
         **base,
+        "probe_gaps": gaps,  # 逐启用探头缺报（覆盖 cure.evaluate 的序列级结果）
         "raw_reading_count": len(readings),
         "judgment_series": [{"ts": ts.isoformat(timespec="seconds"),
                              "temp_c": t} for ts, t in series],
@@ -79,6 +86,50 @@ def analyze(readings, probe_cfg, temp_min, temp_max, hold_minutes,
         "valid_probe_count": valid_count,
         "min_valid_probes": min_valid_probes,
         "insufficient_probes": valid_count < min_valid_probes,
+    }
+
+
+def _probe_gaps(per_probe, active, threshold_minutes):
+    """按每个启用探头的时间序列识别长时间缺报。
+
+    测量窗口取全体启用探头读数的最早/最晚时刻。对每个启用探头：
+    首读数前的起始缺报、相邻读数间断、末读数后的尾随缺报，超过阈值即记录；
+    全程无读数的启用探头按整个测量窗口记一段缺报。
+
+    返回 (缺报区间列表, 有效探头数)；有效探头 = 有读数且尾随缺报未超阈值。
+    """
+    all_ts = [ts for pid in active for ts, _ in per_probe.get(pid, [])]
+    if not all_ts:
+        return [], 0
+    start, end = min(all_ts), max(all_ts)
+    thr = timedelta(minutes=threshold_minutes)
+    gaps = []
+    valid = 0
+    for pid in active:
+        pts = per_probe.get(pid, [])
+        if not pts:
+            if (end - start) > thr:
+                gaps.append(_gap(pid, start, end))
+            continue
+        if (end - pts[-1][0]) <= thr:
+            valid += 1
+        if (pts[0][0] - start) > thr:
+            gaps.append(_gap(pid, start, pts[0][0]))
+        for (t0, _), (t1, _) in zip(pts, pts[1:]):
+            if (t1 - t0) > thr:
+                gaps.append(_gap(pid, t0, t1))
+        if (end - pts[-1][0]) > thr:
+            gaps.append(_gap(pid, pts[-1][0], end))
+    gaps.sort(key=lambda g: (g["from"], str(g["probe_id"])))
+    return gaps, valid
+
+
+def _gap(probe_id, t0, t1):
+    return {
+        "probe_id": probe_id,
+        "from": t0.isoformat(timespec="seconds"),
+        "to": t1.isoformat(timespec="seconds"),
+        "minutes": round((t1 - t0).total_seconds() / 60.0, 2),
     }
 
 

@@ -19,7 +19,7 @@
     "load_at": "2026-09-10T08:00:00",
     "unload_at": "2026-09-10T09:10:00"
   },
-  "created_at": "2026-09-10T18:21:05",
+  "created_at": "2026-09-10T19:35:59",
   "items": [
     {
       "workpiece_id": "W-2003",
@@ -56,12 +56,12 @@
         {
           "code": "UNDER_TIME",
           "detail": "许可区间累计 0.0 分钟，不足要求的 30.0 分钟",
-          "created_at": "2026-09-10T18:21:06"
+          "created_at": "2026-09-10T19:36:00"
         },
         {
           "code": "INSUFFICIENT_PROBES",
           "detail": "有效探头 0 个，少于设定的 1 个，不得判定合格",
-          "created_at": "2026-09-10T18:21:06"
+          "created_at": "2026-09-10T19:36:00"
         }
       ],
       "probe_actions": []
@@ -183,7 +183,7 @@
               }
             ],
             "disabled_reason": "探头松脱，读数卡在环境温度",
-            "disabled_at": "2026-09-10T18:21:06"
+            "disabled_at": "2026-09-10T19:36:00"
           }
         ],
         "divergences": [],
@@ -221,7 +221,7 @@
             "divergences": 0,
             "probe_gaps": 0
           },
-          "created_at": "2026-09-10T18:21:06"
+          "created_at": "2026-09-10T19:36:00"
         }
       ]
     },
@@ -333,5 +333,5 @@
       "probe_actions": []
     }
   ],
-  "exported_at": "2026-09-10T18:21:06"
+  "exported_at": "2026-09-10T19:36:00"
 }

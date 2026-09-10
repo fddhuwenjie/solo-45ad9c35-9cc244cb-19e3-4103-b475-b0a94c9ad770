@@ -8,7 +8,8 @@ def create_app(test_config=None):
     app = Flask(__name__)
     app.config.from_mapping(
         DATABASE=os.path.join(app.instance_path, "ovenline.sqlite"),
-        PROBE_GAP_MINUTES=10,          # 判定序列相邻点间隔超过该分钟数记为探头中断
+        PROBE_GAP_MINUTES=10,          # 启用探头缺报超过该分钟数记为探头中断，
+                                       # 且超过阈值的探头不再计为有效探头
         PROBE_DIVERGENCE_C=5.0,        # 同一时刻有效探头校正值极差超过该温度记为温差异常
         STUCK_PROBE_MIN_CONSECUTIVE=5,  # 同一探头连续相同读数达到该点数记为卡值
         MIN_VALID_PROBES=1,            # 判定合格所需的最少有效探头数

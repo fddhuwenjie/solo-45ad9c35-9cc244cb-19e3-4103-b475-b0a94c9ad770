@@ -28,7 +28,7 @@ TRANSITIONS = {
 # 工件异常标记
 FLAG_UNDER_TIME = "UNDER_TIME"              # 欠时：许可区间累计分钟数不足
 FLAG_OVER_TEMP = "OVER_TEMP"                # 超温：金属温度超过粉料上限
-FLAG_PROBE_GAP = "PROBE_GAP"                # 探头中断：相邻测温点间隔超阈值
+FLAG_PROBE_GAP = "PROBE_GAP"                # 探头中断：启用探头缺报超阈值
 FLAG_STUCK_PROBE = "STUCK_PROBE"            # 探头卡值：连续相同读数超阈值
 FLAG_PROBE_DIVERGENCE = "PROBE_DIVERGENCE"  # 探头温差：有效探头间温差超阈值
 FLAG_INSUFFICIENT_PROBES = "INSUFFICIENT_PROBES"  # 有效探头数不足，不得判定合格
@@ -634,7 +634,7 @@ def unload(bid):
                       f"金属温度最高 {c['max_temp_c']}℃，超过粉料上限")
         if c["probe_gaps"]:
             _add_flag(db, bid, wid, FLAG_PROBE_GAP,
-                      "探头中断: " + json.dumps(c["probe_gaps"], ensure_ascii=False))
+                      "探头缺报: " + json.dumps(c["probe_gaps"], ensure_ascii=False))
         stuck = [a for p in c["probes"] if p["status"] == "ACTIVE"
                  for a in p["anomalies"]]
         if stuck:
@@ -945,6 +945,10 @@ def batch_card(bid):
             )
         divergences = "；".join(
             f"{d['ts']} 极差 {d['spread_c']}℃" for d in c["divergences"]) or "-"
+        gaps = "；".join(
+            f"{html.escape(str(g['probe_id'] or '（隐式通道）'))} "
+            f"{g['from']}–{g['to']}（{g['minutes']} 分钟）"
+            for g in c["probe_gaps"]) or "-"
         series = "，".join(f"{pt['ts'][11:16]}={pt['temp_c']:.1f}"
                            for pt in c["judgment_series"]) or "-"
         probe_blocks.append(
@@ -954,6 +958,7 @@ def batch_card(bid):
             "<th>读数</th><th>异常区间</th></tr>"
             f"{''.join(probe_rows)}</table>"
             f"<p class='small'>探头温差异常：{divergences}</p>"
+            f"<p class='small'>缺报区间：{gaps}</p>"
             f"<p class='small'>判定序列（各时刻有效探头最低校正温度）：{series}</p>"
         )
     html_doc = f"""<!doctype html>

@@ -275,7 +275,82 @@ class MultiProbeTest(unittest.TestCase):
         res = r.get_json()["results"][0]
         self.assertIn("PROBE_GAP", res["flags"])
         gaps = res["cure"]["probe_gaps"]
+        # 逐探头检测：T1/T2 各自产生一段 08:05-08:40 缺报区间
+        self.assertEqual({g["probe_id"] for g in gaps}, {"T1", "T2"})
         self.assertEqual(gaps[0]["minutes"], 35.0)
+        self.assertEqual(gaps[0]["from"], _ts(1))
+        self.assertEqual(gaps[0]["to"], "2026-09-10T08:40:00")
+
+    def test_single_probe_dropout_gap_and_validity(self):
+        """T2 仅 08:00 上报一次后掉线：生成 PROBE_GAP，且不再计为有效探头。"""
+        app = create_app({"DATABASE": os.path.join(self.tmp.name, "t4.sqlite"),
+                          "TESTING": True, "MIN_VALID_PROBES": 2})
+        c = app.test_client()
+        r = c.post("/api/schedule/trial", json={
+            "reason": "t", "start_at": LOAD_AT, "ovens": [OVEN],
+            "powders": [{"batch_no": "P1", "temp_min_c": 160, "temp_max_c": 180,
+                         "hold_minutes": 15}],
+            "forbidden_pairs": [], "orders": [_order("W-1")]})
+        bid = r.get_json()["new_batches"][0]["batch_id"]
+        c.post("/api/workpieces/W-1/probes",
+               json={"probes": [{"probe_id": "T1", "offset_c": 0},
+                                {"probe_id": "T2", "offset_c": 0}]})
+        c.post(f"/api/batches/{bid}/issue")
+        c.post(f"/api/batches/{bid}/load", json={"at": LOAD_AT})
+        # T1 持续上报至 08:25；T2 仅在 08:00 上报一次
+        c.post(f"/api/batches/{bid}/readings", json={"readings":
+               _readings("W-1", "T1", [25, 165, 170, 172, 171, 170])
+               + _readings("W-1", "T2", [25])})
+
+        # 出炉前详情：T2 尾随缺报 25 分钟，有效探头只剩 T1
+        item = c.get(f"/api/batches/{bid}").get_json()["items"][0]
+        cure = item["cure"]
+        self.assertEqual(cure["valid_probe_count"], 1)
+        self.assertTrue(cure["insufficient_probes"])
+        self.assertEqual(len(cure["probe_gaps"]), 1)
+        gap = cure["probe_gaps"][0]
+        self.assertEqual(gap["probe_id"], "T2")
+        self.assertEqual(gap["from"], _ts(0))
+        self.assertEqual(gap["to"], _ts(5))
+        self.assertEqual(gap["minutes"], 25.0)
+
+        # 出炉判定：判定序列本身合格（无 UNDER_TIME），
+        # 但缺报 + 有效探头不足，不得判定合格
+        r = c.post(f"/api/batches/{bid}/unload",
+                   json={"at": "2026-09-10T08:35:00"})
+        res = r.get_json()["results"][0]
+        self.assertEqual(res["verdict"], "NOT_OK")
+        self.assertIn("PROBE_GAP", res["flags"])
+        self.assertIn("INSUFFICIENT_PROBES", res["flags"])
+        self.assertNotIn("UNDER_TIME", res["flags"])
+        self.assertEqual(res["cure"]["valid_probe_count"], 1)
+
+    def test_card_shows_probe_gap_intervals(self):
+        """随炉卡显示缺报区间起止与时长，与炉次详情及 JSON 档案一致。"""
+        bid = self._trial([_order("W-1")])
+        self._register("W-1", [{"probe_id": "T1", "offset_c": 0},
+                               {"probe_id": "T2", "offset_c": 0}])
+        self._issue_load(bid)
+        self._post_readings(
+            bid,
+            _readings("W-1", "T1", [25, 165, 170, 172, 171, 170])
+            + _readings("W-1", "T2", [25]))
+        self.c.post(f"/api/batches/{bid}/unload",
+                    json={"at": "2026-09-10T08:35:00"})
+
+        detail_gaps = self._item(bid, "W-1")["cure"]["probe_gaps"]
+        self.assertEqual(len(detail_gaps), 1)
+        arch = self.c.get(f"/api/batches/{bid}/archive").get_json()
+        arch_gaps = arch["items"][0]["cure"]["probe_gaps"]
+        self.assertEqual(arch_gaps, detail_gaps)  # 档案与详情一致
+
+        card = self.c.get(f"/api/batches/{bid}/card").get_data(as_text=True)
+        g = detail_gaps[0]
+        self.assertIn("缺报区间", card)
+        self.assertIn("T2", card)                    # 缺报探头
+        self.assertIn(g["from"], card)               # 起始时间
+        self.assertIn(g["to"], card)                 # 结束时间
+        self.assertIn(f"{g['minutes']} 分钟", card)  # 时长
 
     # ---------------------------------------------------------- 5. 停用与重算
     def test_disable_detached_probe_recalc_and_audit(self):
