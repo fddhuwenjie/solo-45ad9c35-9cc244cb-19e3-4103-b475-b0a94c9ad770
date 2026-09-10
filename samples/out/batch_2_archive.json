@@ -1,6 +1,6 @@
 {
-  "batch_id": 1,
-  "version_id": 1,
+  "batch_id": 2,
+  "version_id": 2,
   "oven_id": "OVEN-1",
   "state": "CLOSED",
   "window": {
@@ -19,7 +19,7 @@
     "load_at": "2026-09-10T08:00:00",
     "unload_at": "2026-09-10T09:10:00"
   },
-  "created_at": "2026-09-10T18:21:04",
+  "created_at": "2026-09-10T18:20:17",
   "items": [
     {
       "workpiece_id": "W-1001",
@@ -450,5 +450,5 @@
       "probe_actions": []
     }
   ],
-  "exported_at": "2026-09-10T18:21:04"
+  "exported_at": "2026-09-10T18:20:18"
 }

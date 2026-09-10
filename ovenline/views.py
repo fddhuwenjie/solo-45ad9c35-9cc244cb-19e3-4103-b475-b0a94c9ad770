@@ -1,12 +1,18 @@
-"""REST API：试算 / 签发 / 入炉 / 测温回传 / 出炉判定 / 返工结案 / 查询下载。"""
+"""REST API：试算 / 签发 / 入炉 / 测温回传 / 出炉判定 / 返工结案 / 查询下载。
+
+多探头：工件可登记多个金属探头及校准偏移，签发时冻结配置；
+测温按 (炉次, 工件, 探头, 时刻) 幂等去重；判定序列取每个采样时刻
+有效探头校正温度的最低值；故障探头可在出炉前停用并重算该工件。
+"""
 from __future__ import annotations
 
+import html
 import json
 from datetime import datetime, timedelta
 
 from flask import Blueprint, Response, current_app, jsonify, request
 
-from . import cure, scheduler
+from . import probes, scheduler
 from .db import get_db
 
 bp = Blueprint("api", __name__)
@@ -23,6 +29,9 @@ TRANSITIONS = {
 FLAG_UNDER_TIME = "UNDER_TIME"              # 欠时：许可区间累计分钟数不足
 FLAG_OVER_TEMP = "OVER_TEMP"                # 超温：金属温度超过粉料上限
 FLAG_PROBE_GAP = "PROBE_GAP"                # 探头中断：相邻测温点间隔超阈值
+FLAG_STUCK_PROBE = "STUCK_PROBE"            # 探头卡值：连续相同读数超阈值
+FLAG_PROBE_DIVERGENCE = "PROBE_DIVERGENCE"  # 探头温差：有效探头间温差超阈值
+FLAG_INSUFFICIENT_PROBES = "INSUFFICIENT_PROBES"  # 有效探头数不足，不得判定合格
 FLAG_UNISSUED_UNLOAD = "UNISSUED_UNLOAD"    # 未签发出炉
 FLAG_INCOMPAT = "INCOMPAT_CONFLICT"         # 禁配冲突
 
@@ -61,8 +70,33 @@ def _add_flag(db, batch_id, workpiece_id, code, detail):
     )
 
 
-def _cure_for_item(db, batch_id, workpiece_id):
-    """按工件固化窗口评估。已签发炉次用签发快照，草稿用当前主数据。"""
+def _probe_cfg_for_item(db, batch_id, workpiece_id, frozen):
+    """工件在该炉次中的探头配置。
+
+    frozen=True（已签发及以后）取签发时冻结的快照（即使为空也不再回退主数据）；
+    frozen=False（草稿/被取代）取当前登记的探头主数据。
+    """
+    if frozen:
+        rows = db.execute(
+            "SELECT probe_id, offset_c, status, disabled_reason, disabled_at"
+            " FROM batch_item_probes WHERE batch_id=? AND workpiece_id=?"
+            " ORDER BY probe_id", (batch_id, workpiece_id)).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT probe_id, offset_c, 'ACTIVE' AS status,"
+            " NULL AS disabled_reason, NULL AS disabled_at"
+            " FROM probes WHERE workpiece_id=? ORDER BY probe_id",
+            (workpiece_id,)).fetchall()
+    return {r["probe_id"]: dict(r) for r in rows}
+
+
+def _cure_for_item(db, b, workpiece_id):
+    """按工件固化窗口评估。已签发炉次用签发快照，草稿用当前主数据。
+
+    多探头：校正温度 = 原始值 + 冻结的校准偏移；判定序列取每个采样时刻
+    有效探头校正温度的最低值，据此累计固化窗口分钟。
+    """
+    bid = b["id"]
     row = db.execute(
         "SELECT COALESCE(bi.snap_temp_min_c, p.temp_min_c) AS temp_min_c,"
         " COALESCE(bi.snap_temp_max_c, p.temp_max_c) AS temp_max_c,"
@@ -71,21 +105,53 @@ def _cure_for_item(db, batch_id, workpiece_id):
         " JOIN workpieces w ON w.id = bi.workpiece_id"
         " LEFT JOIN powders p ON p.batch_no = w.powder_batch"
         " WHERE bi.batch_id=? AND bi.workpiece_id=?",
-        (batch_id, workpiece_id),
+        (bid, workpiece_id),
     ).fetchone()
     rows = db.execute(
-        "SELECT ts, metal_temp_c FROM readings WHERE batch_id=? AND workpiece_id=?"
-        " ORDER BY ts, id",
-        (batch_id, workpiece_id),
+        "SELECT ts, probe_id, metal_temp_c FROM readings"
+        " WHERE batch_id=? AND workpiece_id=? ORDER BY ts, id",
+        (bid, workpiece_id),
     ).fetchall()
-    pts = [(datetime.fromisoformat(r["ts"]), r["metal_temp_c"]) for r in rows]
-    return cure.evaluate(
+    cfg = _probe_cfg_for_item(db, bid, workpiece_id,
+                              frozen=b["state"] not in ("DRAFT", "SUPERSEDED"))
+    pts = [(datetime.fromisoformat(r["ts"]), r["probe_id"], r["metal_temp_c"])
+           for r in rows]
+    result = probes.analyze(
         pts,
+        {pid: {"offset_c": c["offset_c"], "status": c["status"]}
+         for pid, c in cfg.items()},
         row["temp_min_c"],
         row["temp_max_c"],
         row["hold_minutes"],
         current_app.config["PROBE_GAP_MINUTES"],
+        current_app.config["PROBE_DIVERGENCE_C"],
+        current_app.config["STUCK_PROBE_MIN_CONSECUTIVE"],
+        current_app.config["MIN_VALID_PROBES"],
     )
+    # 补充停用原因/时刻（快照中的处置信息）
+    for p in result["probes"]:
+        c = cfg.get(p["probe_id"]) or {}
+        p["disabled_reason"] = c.get("disabled_reason")
+        p["disabled_at"] = c.get("disabled_at")
+    return result
+
+
+def _cure_summary(c):
+    """判定摘要：探头处置审计记录重算前后的关键结果变化。"""
+    stuck = sum(len(p["anomalies"]) for p in c["probes"]
+                if p["status"] == "ACTIVE")
+    return {
+        "in_window_minutes": c["in_window_minutes"],
+        "required_hold_minutes": c["required_hold_minutes"],
+        "under_time": c["under_time"],
+        "over_temp": c["over_temp"],
+        "max_temp_c": c["max_temp_c"],
+        "valid_probe_count": c["valid_probe_count"],
+        "insufficient_probes": c["insufficient_probes"],
+        "stuck_intervals": stuck,
+        "divergences": len(c["divergences"]),
+        "probe_gaps": len(c["probe_gaps"]),
+    }
 
 
 def _batch_payload(db, b):
@@ -112,11 +178,25 @@ def _batch_payload(db, b):
                 (b["id"], wid),
             )
         ]
+        probe_actions = [
+            {"probe_id": a["probe_id"], "action": a["action"],
+             "reason": a["reason"],
+             "before": json.loads(a["before_json"]) if a["before_json"] else None,
+             "after": json.loads(a["after_json"]) if a["after_json"] else None,
+             "created_at": a["created_at"]}
+            for a in db.execute(
+                "SELECT probe_id, action, reason, before_json, after_json,"
+                " created_at FROM probe_actions"
+                " WHERE batch_id=? AND workpiece_id=? ORDER BY id",
+                (b["id"], wid),
+            )
+        ]
         out_items.append({
             **dict(it),
             "is_rework": bool(it["is_rework"]),
-            "cure": _cure_for_item(db, b["id"], wid),
+            "cure": _cure_for_item(db, b, wid),
             "flags": flags,
+            "probe_actions": probe_actions,
         })
     return {
         "batch_id": b["id"],
@@ -376,6 +456,15 @@ def issue(bid):
             (r["length_mm"], r["width_mm"], r["height_mm"], r["weight_kg"],
              r["powder_batch"], r["temp_min_c"], r["temp_max_c"], r["hold_minutes"],
              bid, r["workpiece_id"]))
+    # 签发时冻结探头配置（编号 + 校准偏移），此后主数据变更不影响本炉次
+    for r in rows:
+        for pr in db.execute(
+                "SELECT probe_id, offset_c FROM probes WHERE workpiece_id=?"
+                " ORDER BY probe_id", (r["workpiece_id"],)).fetchall():
+            db.execute(
+                "INSERT OR IGNORE INTO batch_item_probes"
+                " (batch_id, workpiece_id, probe_id, offset_c) VALUES (?,?,?,?)",
+                (bid, r["workpiece_id"], pr["probe_id"], pr["offset_c"]))
     db.execute("UPDATE batches SET state='ISSUED' WHERE id=?", (bid,))
     db.commit()
     return jsonify({"batch_id": bid, "state": "ISSUED"})
@@ -407,7 +496,11 @@ def load(bid):
 
 @bp.post("/batches/<int:bid>/readings")
 def add_readings(bid):
-    """测温回传：仅在炉（IN_OVEN）状态接收金属探头温度。"""
+    """测温回传：仅在炉（IN_OVEN）状态接收金属探头温度。
+
+    已绑定探头的工件必须携带 probe_id；按 (炉次, 工件, 探头, 时刻) 幂等去重；
+    未绑定、已停用或早于实际入炉时刻的读数一律拒收。
+    """
     db = get_db()
     b = _fetch_batch(db, bid)
     if b is None:
@@ -423,31 +516,63 @@ def add_readings(bid):
         return _err(400, "缺少 readings（或单条 workpiece_id/ts/metal_temp_c）")
     valid = {r["workpiece_id"] for r in db.execute(
         "SELECT workpiece_id FROM batch_items WHERE batch_id=?", (bid,)).fetchall()}
+    # 签发时冻结的探头配置：{工件: {探头: 状态}}
+    probe_cfg = {}
+    for r in db.execute(
+            "SELECT workpiece_id, probe_id, status FROM batch_item_probes"
+            " WHERE batch_id=?", (bid,)).fetchall():
+        probe_cfg.setdefault(r["workpiece_id"], {})[r["probe_id"]] = r["status"]
     load_at = (datetime.fromisoformat(b["actual_load_at"])
                if b["actual_load_at"] else None)
-    accepted, rejected = 0, []
+    accepted, duplicates, rejected = 0, 0, []
     for e in entries:
         wid = e.get("workpiece_id")
+        pid = e.get("probe_id")
         if wid not in valid:
-            rejected.append({"workpiece_id": wid, "reason": "工件不在该炉次"})
+            rejected.append({"workpiece_id": wid, "probe_id": pid,
+                             "reason": "工件不在该炉次"})
             continue
         try:
             ts = _parse_dt(e["ts"], "ts")
             temp = float(e["metal_temp_c"])
         except (KeyError, TypeError, ValueError) as ex:
-            rejected.append({"workpiece_id": wid, "reason": f"测温记录无效: {ex}"})
+            rejected.append({"workpiece_id": wid, "probe_id": pid,
+                             "reason": f"测温记录无效: {ex}"})
+            continue
+        bound = probe_cfg.get(wid, {})
+        if bound:
+            if pid is None:
+                rejected.append({"workpiece_id": wid, "probe_id": pid,
+                                 "reason": "该工件已绑定探头，测温须携带 probe_id"})
+                continue
+            if pid not in bound:
+                rejected.append({"workpiece_id": wid, "probe_id": pid,
+                                 "reason": f"探头 {pid} 未绑定工件 {wid}"})
+                continue
+            if bound[pid] != "ACTIVE":
+                rejected.append({"workpiece_id": wid, "probe_id": pid,
+                                 "reason": f"探头 {pid} 已停用，读数不予采信"})
+                continue
+        elif pid is not None:
+            rejected.append({"workpiece_id": wid, "probe_id": pid,
+                             "reason": f"探头 {pid} 未绑定工件 {wid}"})
             continue
         if load_at is not None and ts < load_at:
-            rejected.append({"workpiece_id": wid,
+            rejected.append({"workpiece_id": wid, "probe_id": pid,
                              "reason": f"测温时刻早于实际入炉时刻 {b['actual_load_at']}，"
                                        "不予采信"})
             continue
-        db.execute(
-            "INSERT INTO readings (batch_id, workpiece_id, ts, metal_temp_c)"
-            " VALUES (?,?,?,?)", (bid, wid, ts.isoformat(), temp))
-        accepted += 1
+        cur = db.execute(
+            "INSERT OR IGNORE INTO readings"
+            " (batch_id, workpiece_id, probe_id, ts, metal_temp_c)"
+            " VALUES (?,?,?,?,?)", (bid, wid, pid, ts.isoformat(), temp))
+        if cur.rowcount:
+            accepted += 1
+        else:
+            duplicates += 1  # 同 (炉次, 工件, 探头, 时刻) 重复回传，幂等忽略
     db.commit()
-    return jsonify({"batch_id": bid, "accepted": accepted, "rejected": rejected})
+    return jsonify({"batch_id": bid, "accepted": accepted,
+                    "duplicates": duplicates, "rejected": rejected})
 
 
 @bp.post("/batches/<int:bid>/unload")
@@ -499,7 +624,7 @@ def unload(bid):
     results = []
     for it in items:
         wid = it["workpiece_id"]
-        c = _cure_for_item(db, bid, wid)
+        c = _cure_for_item(db, b, wid)
         if c["under_time"]:
             _add_flag(db, bid, wid, FLAG_UNDER_TIME,
                       f"许可区间累计 {c['in_window_minutes']} 分钟，"
@@ -510,6 +635,18 @@ def unload(bid):
         if c["probe_gaps"]:
             _add_flag(db, bid, wid, FLAG_PROBE_GAP,
                       "探头中断: " + json.dumps(c["probe_gaps"], ensure_ascii=False))
+        stuck = [a for p in c["probes"] if p["status"] == "ACTIVE"
+                 for a in p["anomalies"]]
+        if stuck:
+            _add_flag(db, bid, wid, FLAG_STUCK_PROBE,
+                      "探头卡值: " + json.dumps(stuck, ensure_ascii=False))
+        if c["divergences"]:
+            _add_flag(db, bid, wid, FLAG_PROBE_DIVERGENCE,
+                      "探头温差: " + json.dumps(c["divergences"], ensure_ascii=False))
+        if c["insufficient_probes"]:
+            _add_flag(db, bid, wid, FLAG_INSUFFICIENT_PROBES,
+                      f"有效探头 {c['valid_probe_count']} 个，"
+                      f"少于设定的 {c['min_valid_probes']} 个，不得判定合格")
         codes = [r["code"] for r in db.execute(
             "SELECT code FROM flags WHERE batch_id=? AND workpiece_id=? ORDER BY id",
             (bid, wid)).fetchall()]
@@ -546,6 +683,106 @@ def close_batch(bid):
     db.execute("UPDATE batches SET state='CLOSED' WHERE id=?", (bid,))
     db.commit()
     return jsonify({"batch_id": bid, "state": "CLOSED"})
+
+
+# ---------------------------------------------------------------- 探头登记与处置
+
+@bp.post("/workpieces/<wid>/probes")
+def register_probes(wid):
+    """登记/更新工件探头及校准偏移；签发时随炉次冻结快照，此后变更只影响新炉次。"""
+    db = get_db()
+    w = db.execute("SELECT id FROM workpieces WHERE id=?", (wid,)).fetchone()
+    if w is None:
+        return _err(404, f"工件 {wid} 不存在")
+    data = request.get_json(silent=True) or {}
+    entries = data.get("probes")
+    if entries is None and "probe_id" in data:
+        entries = [data]
+    if not entries:
+        return _err(400, "缺少 probes（或单条 probe_id/offset_c）")
+    seen = set()
+    for e in entries:
+        pid = str(e.get("probe_id") or "").strip()
+        if not pid:
+            return _err(400, "probe_id 不能为空")
+        if pid in seen:
+            return _err(400, f"请求中探头 {pid} 重复")
+        seen.add(pid)
+        try:
+            offset = float(e.get("offset_c", 0))
+        except (TypeError, ValueError):
+            return _err(400, f"探头 {pid} 的 offset_c 不是数字: {e.get('offset_c')!r}")
+        db.execute(
+            "INSERT INTO probes (workpiece_id, probe_id, offset_c, created_at)"
+            " VALUES (?,?,?,?)"
+            " ON CONFLICT(workpiece_id, probe_id) DO UPDATE SET"
+            " offset_c=excluded.offset_c",
+            (wid, pid, offset, _now().isoformat()))
+    db.commit()
+    return jsonify({"workpiece_id": wid, "probes": _probes_of(db, wid)}), 201
+
+
+@bp.get("/workpieces/<wid>/probes")
+def list_probes(wid):
+    """工件已登记的探头（主数据，不含各炉次冻结快照）。"""
+    db = get_db()
+    w = db.execute("SELECT id FROM workpieces WHERE id=?", (wid,)).fetchone()
+    if w is None:
+        return _err(404, f"工件 {wid} 不存在")
+    return jsonify({"workpiece_id": wid, "probes": _probes_of(db, wid)})
+
+
+def _probes_of(db, wid):
+    return [dict(r) for r in db.execute(
+        "SELECT probe_id, offset_c, created_at FROM probes"
+        " WHERE workpiece_id=? ORDER BY probe_id", (wid,)).fetchall()]
+
+
+@bp.post("/batches/<int:bid>/workpieces/<wid>/probes/<pid>/disable")
+def disable_probe(bid, wid, pid):
+    """出炉前停用故障探头（须填写原因）：只重算该工件并记录结果变化。"""
+    db = get_db()
+    b = _fetch_batch(db, bid)
+    if b is None:
+        return _err(404, f"炉次 {bid} 不存在")
+    if b["state"] not in ("ISSUED", "IN_OVEN"):
+        return _err(409, f"炉次状态为 {b['state']}，不能停用探头（要求出炉前）",
+                    state=b["state"])
+    data = request.get_json(silent=True) or {}
+    reason = str(data.get("reason") or "").strip()
+    if not reason:
+        return _err(400, "停用探头必须填写原因 reason")
+    row = db.execute(
+        "SELECT status, disabled_reason FROM batch_item_probes"
+        " WHERE batch_id=? AND workpiece_id=? AND probe_id=?",
+        (bid, wid, pid)).fetchone()
+    if row is None:
+        return _err(404, f"探头 {pid} 未绑定炉次 {bid} 中的工件 {wid}")
+    if row["status"] == "DISABLED":
+        return _err(409, f"探头 {pid} 已停用", probe_status="DISABLED",
+                    disabled_reason=row["disabled_reason"])
+
+    before = _cure_for_item(db, b, wid)
+    db.execute(
+        "UPDATE batch_item_probes SET status='DISABLED', disabled_reason=?,"
+        " disabled_at=? WHERE batch_id=? AND workpiece_id=? AND probe_id=?",
+        (reason, _now().isoformat(), bid, wid, pid))
+    after = _cure_for_item(db, b, wid)  # 只重算该工件
+    db.execute(
+        "INSERT INTO probe_actions (batch_id, workpiece_id, probe_id, action,"
+        " reason, before_json, after_json, created_at) VALUES (?,?,?,?,?,?,?,?)",
+        (bid, wid, pid, "DISABLE", reason,
+         json.dumps(_cure_summary(before), ensure_ascii=False),
+         json.dumps(_cure_summary(after), ensure_ascii=False),
+         _now().isoformat()))
+    db.commit()
+    return jsonify({
+        "batch_id": bid, "workpiece_id": wid, "probe_id": pid,
+        "status": "DISABLED", "reason": reason,
+        "recalc": {"before": _cure_summary(before),
+                   "after": _cure_summary(after)},
+        "cure": after,
+    })
 
 
 # ---------------------------------------------------------------- 返工与结案
@@ -628,6 +865,7 @@ def workpiece_detail(wid):
         "SELECT batch_id, code, detail, created_at FROM flags WHERE workpiece_id=?"
         " ORDER BY id", (wid,)).fetchall()
     return jsonify({**dict(w), "is_rework": bool(w["is_rework"]),
+                    "probes": _probes_of(db, wid),
                     "batches": [dict(r) for r in batches],
                     "flags": [dict(r) for r in flags]})
 
@@ -684,15 +922,52 @@ def batch_card(bid):
             f"<td>{flag_txt}</td>"
             "</tr>"
         )
-    html = f"""<!doctype html>
+    # 探头明细与最终采用的判定序列（随炉卡质量追溯）
+    probe_blocks = []
+    for it in p["items"]:
+        c = it["cure"]
+        probe_rows = []
+        for pr in c["probes"]:
+            anomalies = "；".join(
+                f"卡值 {a['count']} 点 @ {a['value_c']}℃（{a['from']}–{a['to']}）"
+                for a in pr["anomalies"]) or "-"
+            status = pr["status"]
+            if pr.get("disabled_reason"):
+                status += f"（{html.escape(pr['disabled_reason'])}）"
+            probe_rows.append(
+                "<tr>"
+                f"<td>{html.escape(str(pr['probe_id'] or '（隐式通道）'))}</td>"
+                f"<td>{pr['offset_c']:+.2f}</td>"
+                f"<td>{html.escape(status)}</td>"
+                f"<td>{pr['reading_count']}</td>"
+                f"<td>{anomalies}</td>"
+                "</tr>"
+            )
+        divergences = "；".join(
+            f"{d['ts']} 极差 {d['spread_c']}℃" for d in c["divergences"]) or "-"
+        series = "，".join(f"{pt['ts'][11:16]}={pt['temp_c']:.1f}"
+                           for pt in c["judgment_series"]) or "-"
+        probe_blocks.append(
+            f"<h3>工件 {html.escape(it['workpiece_id'])}"
+            f"（有效探头 {c['valid_probe_count']} / 要求 {c['min_valid_probes']}）</h3>"
+            "<table><tr><th>探头</th><th>校准偏移 ℃</th><th>状态</th>"
+            "<th>读数</th><th>异常区间</th></tr>"
+            f"{''.join(probe_rows)}</table>"
+            f"<p class='small'>探头温差异常：{divergences}</p>"
+            f"<p class='small'>判定序列（各时刻有效探头最低校正温度）：{series}</p>"
+        )
+    html_doc = f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <title>随炉卡 · 炉次 {p['batch_id']}</title>
 <style>
 body {{ font-family: "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; margin: 24px; }}
 h1 {{ font-size: 20px; margin-bottom: 4px; }}
+h2 {{ font-size: 16px; margin: 20px 0 4px; }}
+h3 {{ font-size: 14px; margin: 12px 0 4px; }}
 table {{ border-collapse: collapse; width: 100%; margin-top: 12px; }}
 td, th {{ border: 1px solid #333; padding: 4px 8px; font-size: 13px; }}
 table.meta td {{ border: none; padding: 2px 16px 2px 0; }}
+p.small {{ font-size: 12px; margin: 4px 0; }}
 .sign {{ margin-top: 36px; display: flex; gap: 64px; font-size: 14px; }}
 @media print {{ button {{ display: none; }} }}
 </style></head><body>
@@ -715,7 +990,9 @@ table.meta td {{ border: none; padding: 2px 16px 2px 0; }}
     <th>挂位</th><th>交期</th><th>在区/要求 min</th><th>标记</th></tr>
 {''.join(rows)}
 </table>
+<h2>探头与判定序列</h2>
+{''.join(probe_blocks)}
 <div class="sign"><span>操作工：____________</span><span>检验员：____________</span>
 <span>日期：____________</span></div>
 </body></html>"""
-    return Response(html, mimetype="text/html")
+    return Response(html_doc, mimetype="text/html")

@@ -1,0 +1,337 @@
+{
+  "batch_id": 7,
+  "version_id": 4,
+  "oven_id": "OVEN-1",
+  "state": "UNLOADED",
+  "window": {
+    "min_c": 185.0,
+    "max_c": 190.0,
+    "hold_minutes": 30.0
+  },
+  "total_weight_kg": 32.0,
+  "heatup_minutes": 41.27,
+  "planned": {
+    "load_at": "2026-09-10T10:12:54",
+    "cure_start_at": "2026-09-10T10:54:09",
+    "unload_at": "2026-09-10T11:24:09"
+  },
+  "actual": {
+    "load_at": "2026-09-10T08:00:00",
+    "unload_at": "2026-09-10T09:10:00"
+  },
+  "created_at": "2026-09-10T18:21:05",
+  "items": [
+    {
+      "workpiece_id": "W-2003",
+      "hanger_slot": 1,
+      "slots_used": 1,
+      "order_id": "PO-12",
+      "length_mm": 500.0,
+      "width_mm": 400.0,
+      "height_mm": 300.0,
+      "weight_kg": 10.0,
+      "powder_batch": "P2",
+      "compat_group": "GRP_A",
+      "due_at": "2026-09-10T13:00:00",
+      "is_rework": false,
+      "status": "REWORK_PENDING",
+      "cure": {
+        "reading_count": 0,
+        "in_window_minutes": 0.0,
+        "required_hold_minutes": 30.0,
+        "remaining_minutes": 30.0,
+        "under_time": true,
+        "over_temp": false,
+        "max_temp_c": null,
+        "probe_gaps": [],
+        "raw_reading_count": 0,
+        "judgment_series": [],
+        "probes": [],
+        "divergences": [],
+        "valid_probe_count": 0,
+        "min_valid_probes": 1,
+        "insufficient_probes": true
+      },
+      "flags": [
+        {
+          "code": "UNDER_TIME",
+          "detail": "许可区间累计 0.0 分钟，不足要求的 30.0 分钟",
+          "created_at": "2026-09-10T18:21:06"
+        },
+        {
+          "code": "INSUFFICIENT_PROBES",
+          "detail": "有效探头 0 个，少于设定的 1 个，不得判定合格",
+          "created_at": "2026-09-10T18:21:06"
+        }
+      ],
+      "probe_actions": []
+    },
+    {
+      "workpiece_id": "W-3001",
+      "hanger_slot": 2,
+      "slots_used": 2,
+      "order_id": "PO-11",
+      "length_mm": 800.0,
+      "width_mm": 400.0,
+      "height_mm": 300.0,
+      "weight_kg": 12.0,
+      "powder_batch": "P-RED",
+      "compat_group": null,
+      "due_at": "2026-09-10T14:00:00",
+      "is_rework": false,
+      "status": "CLOSED",
+      "cure": {
+        "reading_count": 15,
+        "in_window_minutes": 40.0,
+        "required_hold_minutes": 20.0,
+        "remaining_minutes": 0.0,
+        "under_time": false,
+        "over_temp": false,
+        "max_temp_c": 184.5,
+        "probe_gaps": [],
+        "raw_reading_count": 30,
+        "judgment_series": [
+          {
+            "ts": "2026-09-10T08:00:00",
+            "temp_c": 25.5
+          },
+          {
+            "ts": "2026-09-10T08:05:00",
+            "temp_c": 60.5
+          },
+          {
+            "ts": "2026-09-10T08:10:00",
+            "temp_c": 100.5
+          },
+          {
+            "ts": "2026-09-10T08:15:00",
+            "temp_c": 140.5
+          },
+          {
+            "ts": "2026-09-10T08:20:00",
+            "temp_c": 165.5
+          },
+          {
+            "ts": "2026-09-10T08:25:00",
+            "temp_c": 178.5
+          },
+          {
+            "ts": "2026-09-10T08:30:00",
+            "temp_c": 182.5
+          },
+          {
+            "ts": "2026-09-10T08:35:00",
+            "temp_c": 184.5
+          },
+          {
+            "ts": "2026-09-10T08:40:00",
+            "temp_c": 183.5
+          },
+          {
+            "ts": "2026-09-10T08:45:00",
+            "temp_c": 182.5
+          },
+          {
+            "ts": "2026-09-10T08:50:00",
+            "temp_c": 184.5
+          },
+          {
+            "ts": "2026-09-10T08:55:00",
+            "temp_c": 183.5
+          },
+          {
+            "ts": "2026-09-10T09:00:00",
+            "temp_c": 182.5
+          },
+          {
+            "ts": "2026-09-10T09:05:00",
+            "temp_c": 181.5
+          },
+          {
+            "ts": "2026-09-10T09:10:00",
+            "temp_c": 120.5
+          }
+        ],
+        "probes": [
+          {
+            "probe_id": "T1",
+            "offset_c": 0.5,
+            "status": "ACTIVE",
+            "reading_count": 15,
+            "min_c": 25.5,
+            "max_c": 184.5,
+            "anomalies": [],
+            "disabled_reason": null,
+            "disabled_at": null
+          },
+          {
+            "probe_id": "T2",
+            "offset_c": -0.5,
+            "status": "DISABLED",
+            "reading_count": 15,
+            "min_c": 24.5,
+            "max_c": 164.5,
+            "anomalies": [
+              {
+                "type": "STUCK_PROBE",
+                "probe_id": "T2",
+                "probe_status": "DISABLED",
+                "value_c": 27.5,
+                "from": "2026-09-10T08:25:00",
+                "to": "2026-09-10T09:10:00",
+                "count": 10
+              }
+            ],
+            "disabled_reason": "探头松脱，读数卡在环境温度",
+            "disabled_at": "2026-09-10T18:21:06"
+          }
+        ],
+        "divergences": [],
+        "valid_probe_count": 1,
+        "min_valid_probes": 1,
+        "insufficient_probes": false
+      },
+      "flags": [],
+      "probe_actions": [
+        {
+          "probe_id": "T2",
+          "action": "DISABLE",
+          "reason": "探头松脱，读数卡在环境温度",
+          "before": {
+            "in_window_minutes": 0.0,
+            "required_hold_minutes": 20.0,
+            "under_time": true,
+            "over_temp": false,
+            "max_temp_c": 164.5,
+            "valid_probe_count": 2,
+            "insufficient_probes": false,
+            "stuck_intervals": 1,
+            "divergences": 10,
+            "probe_gaps": 0
+          },
+          "after": {
+            "in_window_minutes": 40.0,
+            "required_hold_minutes": 20.0,
+            "under_time": false,
+            "over_temp": false,
+            "max_temp_c": 184.5,
+            "valid_probe_count": 1,
+            "insufficient_probes": false,
+            "stuck_intervals": 0,
+            "divergences": 0,
+            "probe_gaps": 0
+          },
+          "created_at": "2026-09-10T18:21:06"
+        }
+      ]
+    },
+    {
+      "workpiece_id": "W-3002",
+      "hanger_slot": 4,
+      "slots_used": 2,
+      "order_id": "PO-11",
+      "length_mm": 700.0,
+      "width_mm": 400.0,
+      "height_mm": 300.0,
+      "weight_kg": 10.0,
+      "powder_batch": "P-RED",
+      "compat_group": null,
+      "due_at": "2026-09-10T14:00:00",
+      "is_rework": false,
+      "status": "CLOSED",
+      "cure": {
+        "reading_count": 15,
+        "in_window_minutes": 40.0,
+        "required_hold_minutes": 20.0,
+        "remaining_minutes": 0.0,
+        "under_time": false,
+        "over_temp": false,
+        "max_temp_c": 184.0,
+        "probe_gaps": [],
+        "raw_reading_count": 15,
+        "judgment_series": [
+          {
+            "ts": "2026-09-10T08:00:00",
+            "temp_c": 25.0
+          },
+          {
+            "ts": "2026-09-10T08:05:00",
+            "temp_c": 60.0
+          },
+          {
+            "ts": "2026-09-10T08:10:00",
+            "temp_c": 100.0
+          },
+          {
+            "ts": "2026-09-10T08:15:00",
+            "temp_c": 140.0
+          },
+          {
+            "ts": "2026-09-10T08:20:00",
+            "temp_c": 165.0
+          },
+          {
+            "ts": "2026-09-10T08:25:00",
+            "temp_c": 178.0
+          },
+          {
+            "ts": "2026-09-10T08:30:00",
+            "temp_c": 182.0
+          },
+          {
+            "ts": "2026-09-10T08:35:00",
+            "temp_c": 184.0
+          },
+          {
+            "ts": "2026-09-10T08:40:00",
+            "temp_c": 183.0
+          },
+          {
+            "ts": "2026-09-10T08:45:00",
+            "temp_c": 182.0
+          },
+          {
+            "ts": "2026-09-10T08:50:00",
+            "temp_c": 184.0
+          },
+          {
+            "ts": "2026-09-10T08:55:00",
+            "temp_c": 183.0
+          },
+          {
+            "ts": "2026-09-10T09:00:00",
+            "temp_c": 182.0
+          },
+          {
+            "ts": "2026-09-10T09:05:00",
+            "temp_c": 181.0
+          },
+          {
+            "ts": "2026-09-10T09:10:00",
+            "temp_c": 120.0
+          }
+        ],
+        "probes": [
+          {
+            "probe_id": "T1",
+            "offset_c": 0.0,
+            "status": "ACTIVE",
+            "reading_count": 15,
+            "min_c": 25.0,
+            "max_c": 184.0,
+            "anomalies": [],
+            "disabled_reason": null,
+            "disabled_at": null
+          }
+        ],
+        "divergences": [],
+        "valid_probe_count": 1,
+        "min_valid_probes": 1,
+        "insufficient_probes": false
+      },
+      "flags": [],
+      "probe_actions": []
+    }
+  ],
+  "exported_at": "2026-09-10T18:21:06"
+}

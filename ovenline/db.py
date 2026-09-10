@@ -91,8 +91,44 @@ CREATE TABLE IF NOT EXISTS readings (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_id     INTEGER NOT NULL REFERENCES batches(id),
     workpiece_id TEXT NOT NULL,
+    probe_id     TEXT,                     -- 探头编号；NULL 表示未登记探头工件的隐式通道
     ts           TEXT NOT NULL,
-    metal_temp_c REAL NOT NULL       -- 工件金属探头温度
+    metal_temp_c REAL NOT NULL             -- 探头原始值（校正 = 原始值 + 校准偏移）
+);
+
+-- 工件探头登记（主数据）：校准偏移；签发时快照进 batch_item_probes 冻结
+CREATE TABLE IF NOT EXISTS probes (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    workpiece_id TEXT NOT NULL REFERENCES workpieces(id),
+    probe_id     TEXT NOT NULL,            -- 探头编号（同一工件内唯一）
+    offset_c     REAL NOT NULL DEFAULT 0,  -- 校准偏移：校正温度 = 原始值 + 偏移
+    created_at   TEXT NOT NULL,
+    UNIQUE (workpiece_id, probe_id)
+);
+
+-- 签发时冻结的探头配置快照；出炉前可停用故障探头（DISABLED）
+CREATE TABLE IF NOT EXISTS batch_item_probes (
+    batch_id        INTEGER NOT NULL REFERENCES batches(id),
+    workpiece_id    TEXT NOT NULL,
+    probe_id        TEXT NOT NULL,
+    offset_c        REAL NOT NULL,         -- 签发时冻结的校准偏移
+    status          TEXT NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE / DISABLED
+    disabled_reason TEXT,
+    disabled_at     TEXT,
+    PRIMARY KEY (batch_id, workpiece_id, probe_id)
+);
+
+-- 探头处置审计：停用故障探头后只重算该工件，记录重算前后判定摘要
+CREATE TABLE IF NOT EXISTS probe_actions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id     INTEGER NOT NULL,
+    workpiece_id TEXT NOT NULL,
+    probe_id     TEXT NOT NULL,
+    action       TEXT NOT NULL,            -- DISABLE 停用故障探头
+    reason       TEXT,
+    before_json  TEXT,                     -- 重算前判定摘要
+    after_json   TEXT,                     -- 重算后判定摘要
+    created_at   TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS flags (
@@ -133,6 +169,18 @@ def init_db():
     for col, typ in snapshot_cols.items():
         if col not in existing:
             db.execute(f"ALTER TABLE batch_items ADD COLUMN {col} {typ}")
+    # 兼容旧库：readings 补探头列，并按 (炉次, 工件, 探头, 时刻) 建幂等去重索引
+    existing = {r["name"] for r in db.execute("PRAGMA table_info(readings)")}
+    if "probe_id" not in existing:
+        db.execute("ALTER TABLE readings ADD COLUMN probe_id TEXT")
+    # 建唯一索引前清理历史重复读数（保留最早一条）
+    db.execute(
+        "DELETE FROM readings WHERE id NOT IN"
+        " (SELECT MIN(id) FROM readings"
+        "  GROUP BY batch_id, workpiece_id, COALESCE(probe_id, ''), ts)")
+    db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_readings_dedup ON readings"
+        " (batch_id, workpiece_id, COALESCE(probe_id, ''), ts)")
     db.commit()
 
 
