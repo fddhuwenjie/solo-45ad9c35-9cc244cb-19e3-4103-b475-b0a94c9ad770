@@ -69,6 +69,27 @@ class RegressionTest(unittest.TestCase):
         self.assertIn("W-OK", planned)
         self.assertNotIn("W-BAD", planned)
 
+    # 缺陷 1b：复用 workpiece_id 提交未登记粉料，不得按库内残留旧粉料编排
+    def test_reused_id_with_unknown_powder_not_planned(self):
+        # v1：W-REUSE 用已登记粉料正常排产（草稿）
+        d1 = self._trial(_trial_payload([_order("W-REUSE")], reason="v1"))
+        planned1 = [i["workpiece_id"] for b in d1["new_batches"] for i in b["items"]]
+        self.assertIn("W-REUSE", planned1)
+
+        # v2：同一 workpiece_id 提交未登记粉料
+        d2 = self._trial(_trial_payload([_order("W-REUSE", powder="P-GHOST")],
+                                        reason="v2 换粉料(未登记)"))
+        # 只出现在 unscheduled，且原因 UNKNOWN_POWDER
+        bad = [u for u in d2["unscheduled"] if u["workpiece_id"] == "W-REUSE"]
+        self.assertEqual(len(bad), 1)
+        self.assertEqual(bad[0]["reason"], "UNKNOWN_POWDER")
+        # 不得进入 new_batches
+        planned2 = [i["workpiece_id"] for b in d2["new_batches"] for i in b["items"]]
+        self.assertNotIn("W-REUSE", planned2)
+        # 数据库状态不得仍为 SCHEDULED
+        w = self.c.get("/api/workpieces/W-REUSE").get_json()
+        self.assertNotEqual(w["status"], "SCHEDULED")
+
     # 缺陷 2：已签发炉次冻结签发时的尺寸与固化窗口
     def test_issued_batch_snapshot_frozen(self):
         d = self._trial(_trial_payload([_order("W-1")], reason="v1"))

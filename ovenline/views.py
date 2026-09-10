@@ -305,8 +305,11 @@ def trial():
 
     powder_all = {r["batch_no"]: dict(r)
                   for r in db.execute("SELECT * FROM powders").fetchall()}
+    # 本次提交因未登记粉料被拒的工件：不得按库内残留旧粉料参与本次编排
+    rejected_ids = {u["workpiece_id"] for u in pre_unscheduled}
     pending = [dict(r) for r in db.execute(
-        "SELECT * FROM workpieces WHERE status='PENDING' ORDER BY id").fetchall()]
+        "SELECT * FROM workpieces WHERE status='PENDING' ORDER BY id").fetchall()
+        if r["id"] not in rejected_ids]
     planned, unscheduled = scheduler.build_plan(
         pending, powder_all, oven_rows, forbidden, start_at, busy_until)
 
