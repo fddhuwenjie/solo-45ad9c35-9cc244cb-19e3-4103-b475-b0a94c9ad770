@@ -630,7 +630,7 @@ def _oven_timelines(oven_rows, carried, new_batches, windows_by_oven):
     new_batches: 本次试算新排炉次 dict（含 turnaround_end_at 与逾期字段）
     """
     timelines = []
-    for ov in oven_rows:
+    for ov in sorted(oven_rows, key=lambda o: o["id"]):
         oid = ov["id"]
         turnaround = float(ov["turnaround_minutes"])
         segments = []

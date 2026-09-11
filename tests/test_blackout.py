@@ -334,6 +334,130 @@ class BlackoutTest(unittest.TestCase):
         kinds = [s["kind"] for s in d["oven_timelines"][0]["segments"]]
         self.assertIn("BLACKOUT", kinds)
 
+    # -------------------------------------------- 6. 下游炉次累计推迟（无停机基准差值）
+    def test_downstream_batch_inherits_cumulative_delay(self):
+        # 两种粉料窗口不相交 → 同炉两个炉次串行衔接
+        d = self._trial({
+            "reason": "下游累计", "start_at": "2026-09-10T08:00:00",
+            "ovens": [OVEN],
+            "powders": [
+                {"batch_no": "P1", "temp_min_c": 160, "temp_max_c": 180,
+                 "hold_minutes": 15},
+                {"batch_no": "P2", "temp_min_c": 200, "temp_max_c": 220,
+                 "hold_minutes": 15},
+            ],
+            "forbidden_pairs": [],
+            "blackout_windows": [_window("2026-09-10T08:30:00",
+                                         "2026-09-10T09:00:00")],
+            "orders": [_order("W-1", due="2026-09-10T09:30:00"),
+                       _order("W-2", due="2026-09-10T10:30:00", weight=10)
+                       | {"powder_batch": "P2"}],
+        })
+        self.assertEqual(len(d["new_batches"]), 2)
+        b1 = next(b for b in d["new_batches"]
+                  if b["items"][0]["workpiece_id"] == "W-1")
+        b2 = next(b for b in d["new_batches"]
+                  if b["items"][0]["workpiece_id"] == "W-2")
+        # 上游炉次直接撞窗：移到 09:00，等待 60 分钟
+        self.assertEqual(b1["planned_load_at"], "2026-09-10T09:00:00")
+        self.assertEqual(b1["blackout_wait_minutes"], 60.0)
+        self.assertEqual(len(b1["avoided_windows"]), 1)
+        # 下游炉次自身不碰任何停机窗，但承接上游累计推迟：
+        # 无停机基准 09:06:27 装载/10:07:54 出炉，实际 10:06:27/11:07:54
+        # （P2 目标温度 210℃，升温 46.45 分钟）
+        self.assertEqual(b2["avoided_windows"], [])
+        self.assertEqual(b2["baseline_load_at"], "2026-09-10T09:06:27")
+        self.assertEqual(b2["baseline_unload_at"], "2026-09-10T10:07:54")
+        self.assertEqual(b2["planned_load_at"], "2026-09-10T10:06:27")
+        self.assertEqual(b2["planned_unload_at"], "2026-09-10T11:07:54")
+        self.assertEqual(b2["blackout_wait_minutes"], 60.0)
+        # 逾期变化同样相对无停机基准：基准不逾期，实际逾期 37.9 分钟
+        self.assertEqual(b2["baseline_lateness_minutes"], 0.0)
+        self.assertAlmostEqual(b2["lateness_minutes"], 37.9, places=2)
+        self.assertAlmostEqual(b2["lateness_delta_minutes"], 37.9, places=2)
+
+
+class OvenSelectionTest(unittest.TestCase):
+    """选炉缺陷回归：先应用各炉停机窗再按（逾期, 完工时刻, 炉号）选炉，
+    结果不得随 ovens 请求顺序改变。"""
+
+    def setUp(self):
+        self._tmps = []
+
+    def tearDown(self):
+        for t in self._tmps:
+            t.cleanup()
+
+    def _client(self):
+        tmp = tempfile.TemporaryDirectory()
+        self._tmps.append(tmp)
+        app = create_app({"DATABASE": os.path.join(tmp.name, "t.sqlite"),
+                          "TESTING": True})
+        return app.test_client()
+
+    @staticmethod
+    def _oven(oid):
+        return dict(OVEN, id=oid)
+
+    def _trial(self, client, ovens, blackouts):
+        r = client.post("/api/schedule/trial", json={
+            "reason": "选炉", "start_at": "2026-09-10T08:00:00",
+            "ovens": ovens,
+            "powders": [{"batch_no": "P1", "temp_min_c": 160, "temp_max_c": 180,
+                         "hold_minutes": 15}],
+            "forbidden_pairs": [],
+            "blackout_windows": blackouts,
+            "orders": [_order("W-1", due="2026-09-10T09:30:00")]})
+        self.assertEqual(r.status_code, 201, r.get_data(as_text=True))
+        return r.get_json()
+
+    def test_oven_choice_independent_of_request_order(self):
+        # OVEN-1 有 08:30-09:00 停机；两种 ovens 顺序分别试算（各自干净库）
+        blackouts = [_window("2026-09-10T08:30:00", "2026-09-10T09:00:00",
+                             oven="OVEN-1")]
+        d1 = self._trial(self._client(),
+                         [self._oven("OVEN-1"), self._oven("OVEN-2")], blackouts)
+        d2 = self._trial(self._client(),
+                         [self._oven("OVEN-2"), self._oven("OVEN-1")], blackouts)
+        for d in (d1, d2):
+            self.assertEqual(len(d["new_batches"]), 1)
+            b = d["new_batches"][0]
+            # 避让后 OVEN-2 完工更早且不逾期 → 选 OVEN-2，与请求顺序无关
+            self.assertEqual(b["oven_id"], "OVEN-2")
+            self.assertEqual(b["planned_load_at"], "2026-09-10T08:00:00")
+            self.assertEqual(b["planned_unload_at"], "2026-09-10T08:51:27")
+            self.assertEqual(b["blackout_wait_minutes"], 0.0)
+            self.assertEqual(b["lateness_minutes"], 0.0)
+        # 两次响应的排产结果完全一致
+        self.assertEqual(
+            [{k: v for k, v in d1["new_batches"][0].items() if k != "batch_id"}],
+            [{k: v for k, v in d2["new_batches"][0].items() if k != "batch_id"}])
+
+    def test_oven_choice_tie_break_deterministic(self):
+        # 无停机、两炉参数相同：完工时刻并列时按炉号定局，与请求顺序无关
+        d1 = self._trial(self._client(),
+                         [self._oven("OVEN-2"), self._oven("OVEN-1")], [])
+        d2 = self._trial(self._client(),
+                         [self._oven("OVEN-1"), self._oven("OVEN-2")], [])
+        self.assertEqual(d1["new_batches"][0]["oven_id"], "OVEN-1")
+        self.assertEqual(d2["new_batches"][0]["oven_id"], "OVEN-1")
+
+    def test_oven_choice_prefers_on_time_oven(self):
+        # OVEN-1 停机导致逾期、OVEN-2 准点：即使 OVEN-1 在前也选 OVEN-2
+        blackouts = [_window("2026-09-10T08:30:00", "2026-09-10T09:00:00",
+                             oven="OVEN-1")]
+        d = self._trial(self._client(),
+                        [self._oven("OVEN-1"), self._oven("OVEN-2")], blackouts)
+        b = d["new_batches"][0]
+        self.assertEqual(b["oven_id"], "OVEN-2")
+        self.assertEqual(b["lateness_minutes"], 0.0)
+        # 时间线按炉号排序，两炉段落各自独立
+        tls = {t["oven_id"]: t for t in d["oven_timelines"]}
+        self.assertEqual([s["kind"] for s in tls["OVEN-1"]["segments"]],
+                         ["BLACKOUT"])
+        self.assertEqual([s["kind"] for s in tls["OVEN-2"]["segments"]],
+                         ["PRODUCTION", "TURNAROUND"])
+
 
 if __name__ == "__main__":
     unittest.main()

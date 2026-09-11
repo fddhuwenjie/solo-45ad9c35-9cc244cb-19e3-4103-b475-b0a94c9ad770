@@ -59,16 +59,21 @@ samples/
 - 工件占用挂位数 = max(按水平尺寸/吊点间距， 按重量/单吊点承重)，取相邻挂位；
 - 升温分钟 = (窗口中值 − 环境温度)/升温速率 + 装载公斤 × 热惯性系数；
 - 同炉次按工件交期先后串行衔接，已签发/在炉炉次占用炉膛的时间段自动避让；
+- **新建炉次选炉**：先分别应用各炉停机窗试算该工件的完工时刻，再按
+  （逾期分钟, 完工时刻, 炉号）选优——键中不含请求顺序相关量，
+  结果不随 `ovens` 传入顺序改变；
 - **停机窗（清炉/校准/检修）**：试算请求可带 `blackout_windows`
   （每段含 `oven_id`、`kind`、`start_at`、`end_at`、`note`；
   `kind` 支持 `CLEANING`/`CALIBRATION`/`MAINTENANCE` 或中文 清炉/校准/检修）。
   起止倒序、同炉重叠、未知炉号一律 400 拒绝。
   排产时**装载、升温、保温及周转是一个不可拆分的占用区间**，撞上停机窗
   便整体移到该窗结束之后，再比较各炉完工时刻与交期；
-- 每个新炉次返回**因避让增加的等待分钟**（`blackout_wait_minutes`）与
-  **逾期变化**（`lateness_minutes` / `baseline_lateness_minutes` /
-  `lateness_delta_minutes`，按炉内最早交期衡量），以及未避让的基准时刻
-  （`baseline_load_at` / `baseline_unload_at`）和被避让的窗口；
+- 排产同时保留一套**不应用停机窗的基准排程**，逐炉次差值即停机造成的
+  **累计推迟**（上游炉次被推迟后，下游炉次同样承接）：每个新炉次返回
+  `blackout_wait_minutes`（相对基准的等待分钟）与逾期变化
+  （`lateness_minutes` / `baseline_lateness_minutes` /
+  `lateness_delta_minutes`，按炉内最早交期衡量），以及基准时刻
+  （`baseline_load_at` / `baseline_unload_at`）和本炉次直接避让的窗口；
 - 试算响应带**逐炉时间线**（`oven_timelines`）：区分生产占用 `PRODUCTION`、
   周转 `TURNAROUND` 与停机 `BLACKOUT`，并给出各炉完工/释放时刻与逾期汇总；
 - 停机窗写入**排产版本快照**（`blackout_windows` 表 + 版本 `params_json`），
