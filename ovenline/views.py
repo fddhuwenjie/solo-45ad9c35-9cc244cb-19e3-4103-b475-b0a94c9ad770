@@ -18,7 +18,7 @@ from datetime import datetime, timedelta
 
 from flask import Blueprint, Response, current_app, jsonify, request
 
-from . import probes, progress, scheduler
+from . import probes, progress, racking, scheduler
 from .db import get_db
 
 bp = Blueprint("api", __name__)
@@ -50,6 +50,10 @@ CAL_COVERAGE = "CALIBRATION_COVERAGE"            # 点列区间未覆盖粉料�
 # 停机窗类型（清炉/校准/检修整段占用烘炉）
 BLACKOUT_KINDS = {"CLEANING": "清炉", "CALIBRATION": "校准", "MAINTENANCE": "检修"}
 _KIND_ALIASES = {v: k for k, v in BLACKOUT_KINDS.items()}
+
+# 吊点禁用类型：临时封位（清炉/检修时挂位不可用）/ 吊点故障
+HANGER_BLACKOUT = "BLACKOUT"
+HANGER_FAULT = "FAULT"
 
 
 # ---------------------------------------------------------------- 工具
@@ -495,7 +499,8 @@ def _batch_payload(db, b, as_of=None, as_of_source=None):
         " COALESCE(bi.snap_powder_batch, w.powder_batch) AS powder_batch,"
         " w.compat_group, w.due_at, w.is_rework, w.status,"
         " bi.actual_unload_at, bi.unload_sequence, bi.first_met_at,"
-        " bi.final_verdict, bi.forced, bi.force_reason, bi.progress_snapshot_json"
+        " bi.final_verdict, bi.forced, bi.force_reason, bi.progress_snapshot_json,"
+        " bi.rod_id, bi.load_in_sequence, bi.placement_json"
         " FROM batch_items bi JOIN workpieces w ON w.id = bi.workpiece_id"
         " WHERE bi.batch_id=? ORDER BY bi.hanger_slot",
         (b["id"],),
@@ -526,9 +531,13 @@ def _batch_payload(db, b, as_of=None, as_of_source=None):
         ]
         out_items.append({
             **{k: it[k] for k in it.keys()
-               if k not in ("forced", "progress_snapshot_json")},
+               if k not in ("forced", "progress_snapshot_json",
+                            "placement_json")},
             "is_rework": bool(it["is_rework"]),
             "forced": bool(it["forced"]),
+            # 吊具布置（挂杆/吊点坐标/旋转/各点载荷/重心；签发后为冻结快照）
+            "placement": (json.loads(it["placement_json"])
+                          if it["placement_json"] else None),
             "cure": _cure_for_item(db, b, wid),
             "flags": flags,
             "probe_actions": probe_actions,
@@ -586,6 +595,10 @@ def _batch_payload(db, b, as_of=None, as_of_source=None):
         },
         "actual": {"load_at": b["actual_load_at"], "unload_at": b["actual_unload_at"]},
         "created_at": b["created_at"],
+        # 吊具布置：挂杆/吊点坐标、旋转、各点载荷、分区、横梁总载、力矩、搬入顺序
+        # （草稿取当前 arrangement_json；签发后为冻结快照，主数据/新版本不改变它）
+        "rack_layout": (json.loads(b["arrangement_json"])
+                        if b["arrangement_json"] else None),
         # 停机避让：关联停机窗与排产计算依据（未避让基准时刻/等待分钟/逾期变化）
         "blackout_windows": blackouts,
         "blackout_wait_minutes": b["blackout_wait_minutes"],
@@ -595,6 +608,169 @@ def _batch_payload(db, b, as_of=None, as_of_source=None):
         "unload_order": unload_order,
         # 同一进度快照贯穿炉次详情 / JSON 档案 / 随炉卡
         "progress": progress_snapshot,
+    }
+
+
+# ---------------------------------------------------------------- 吊具布置
+
+def _racks_for(oven_rows):
+    """为本次试算的各炉构建挂杆/吊点模型（纯函数 racking.build_rack）。"""
+    return {ov["id"]: racking.build_rack(ov) for ov in oven_rows}
+
+
+def _parse_hanger_blackouts(raw_list, oven_rows):
+    """校验试算请求中的吊点禁用时段（临时封掉的挂位）。
+
+    元素：{oven_id, rod_id, point_index, start_at, end_at(可省=开放结束), note}。
+    未知炉号 / 挂杆 / 吊点编号、起止倒序一律 400（ValueError）。
+    返回 [{oven_id, rod_id, point_index, start_at(datetime), end_at(datetime|None)}]。
+    """
+    if raw_list is None:
+        return []
+    if not isinstance(raw_list, list):
+        raise ValueError("hanger_blackouts 须为数组，元素含"
+                         " oven_id/rod_id/point_index/start_at/end_at")
+    racks = _racks_for(oven_rows)
+    out = []
+    for hb in raw_list:
+        if not isinstance(hb, dict):
+            raise ValueError(f"吊点禁用须为对象: {hb!r}")
+        missing = [k for k in ("oven_id", "rod_id", "point_index", "start_at")
+                   if k not in hb]
+        if missing:
+            raise ValueError(f"吊点禁用缺少字段: {missing}")
+        oid, rid = hb["oven_id"], str(hb["rod_id"])
+        try:
+            idx = int(hb["point_index"])
+        except (TypeError, ValueError):
+            raise ValueError(f"吊点编号须为整数: {hb['point_index']!r}")
+        rack = racks.get(oid)
+        if rack is None:
+            raise ValueError(f"吊点禁用引用未知炉号: {oid!r}")
+        if rack.point(rid, idx) is None:
+            raise ValueError(f"吊点不存在: 炉 {oid} 挂杆 {rid} 编号 {idx}")
+        start = _parse_dt(hb["start_at"], "hanger_blackouts.start_at")
+        end = None
+        if hb.get("end_at") is not None and str(hb.get("end_at")).strip():
+            end = _parse_dt(hb["end_at"], "hanger_blackouts.end_at")
+            if end <= start:
+                raise ValueError(
+                    f"吊点禁用起止倒序: {start.isoformat()} 不早于 {end.isoformat()}")
+        out.append({"oven_id": oid, "rod_id": rid, "point_index": idx,
+                    "start_at": start, "end_at": end,
+                    "note": hb.get("note"), "kind": HANGER_BLACKOUT})
+    return out
+
+
+def _active_faults(db):
+    """当前未修复的吊点故障（跨版本持续生效），返回 point_blackouts 结构。
+
+    开放结束（resolved_at 为空）的故障视为从 started_at 起持续禁用；
+    end_at 用 None 表示，计时检查时按 +inf 处理。
+    """
+    rows = db.execute(
+        "SELECT oven_id, rod_id, point_index, started_at, reason"
+        " FROM hanger_faults WHERE resolved_at IS NULL ORDER BY id").fetchall()
+    out = {}
+    for r in rows:
+        out.setdefault(r["oven_id"], []).append({
+            "oven_id": r["oven_id"], "rod_id": r["rod_id"],
+            "point_index": r["point_index"],
+            "start_at": datetime.fromisoformat(r["started_at"]),
+            "end_at": None, "note": r["reason"], "kind": HANGER_FAULT})
+    return out
+
+
+def _hanger_conflicts(db, carried, point_windows):
+    """吊点禁用/故障与已签发/在炉炉次冻结布置的冲突（这些炉次不得改动）。"""
+    conflicts = []
+    for c in carried:
+        used = {}
+        for bi in db.execute(
+                "SELECT workpiece_id, rod_id, placement_json FROM batch_items"
+                " WHERE batch_id=?", (c["id"],)).fetchall():
+            if not bi["placement_json"]:
+                continue
+            plc = json.loads(bi["placement_json"])
+            for p in plc.get("occupied_points", []):
+                used[(plc.get("rod_id"), p["index"])] = bi["workpiece_id"]
+        for pb in point_windows.get(c["oven_id"], []):
+            hit = used.get((pb["rod_id"], pb["point_index"]))
+            if hit:
+                conflicts.append({
+                    "batch_id": c["id"], "batch_state": c["state"],
+                    "oven_id": c["oven_id"], "rod_id": pb["rod_id"],
+                    "point_index": pb["point_index"], "kind": pb["kind"],
+                    "workpiece_id": hit,
+                    "note": pb.get("note"),
+                    "started_at": pb["start_at"].isoformat(timespec="seconds"),
+                    "end_at": pb["end_at"].isoformat(timespec="seconds")
+                              if pb["end_at"] else None,
+                    "detail": "禁用吊点被已签发炉次占用，该炉次布置冻结不可重排",
+                })
+    return conflicts
+
+
+def _point_blackout_json(pb):
+    return {"oven_id": pb["oven_id"], "rod_id": pb["rod_id"],
+            "point_index": pb["point_index"], "kind": pb.get("kind",
+                                                             HANGER_BLACKOUT),
+            "start_at": pb["start_at"].isoformat(timespec="seconds"),
+            "end_at": pb["end_at"].isoformat(timespec="seconds")
+                      if pb["end_at"] else None, "note": pb.get("note")}
+
+
+def _merge_point_blackouts(version_windows, active_faults):
+    """合并试算级禁用时段与持续吊点故障（开放结束按 +inf 参与区间相交）。"""
+    merged = {}
+    for oid, lst in version_windows.items():
+        merged[oid] = list(lst)
+    for oid, lst in active_faults.items():
+        merged.setdefault(oid, [])
+        existing = {(w["rod_id"], w["point_index"], w["start_at"]) for w in merged[oid]}
+        for w in lst:
+            key = (w["rod_id"], w["point_index"], w["start_at"])
+            if key not in existing:
+                merged[oid].append(w)
+    return merged
+
+
+def _wp_kwargs(o):
+    """订单中的吊具布置字段（重心/旋转/吊耳/净距），缺省给默认值。"""
+    def _num(key, default=0.0):
+        v = o.get(key, default)
+        return float(v) if v is not None else default
+    rots = o.get("allowed_rotations_deg")
+    if rots is None:
+        rots_json = None
+    else:
+        if not isinstance(rots, list) or not rots:
+            raise ValueError("allowed_rotations_deg 须为非空角度数组")
+        rots_json = json.dumps(sorted({int(x) for x in rots}))
+    lugs = o.get("lift_points_mm")
+    if lugs is not None:
+        if not isinstance(lugs, list) or not lugs:
+            raise ValueError("lift_points_mm 须为非空坐标数组")
+        lugs = [float(x) for x in lugs]
+    return {
+        "cg_offset_x_mm": _num("cg_offset_x_mm"),
+        "cg_offset_y_mm": _num("cg_offset_y_mm"),
+        "allowed_rotations": rots_json,
+        "lift_points_json": json.dumps(lugs) if lugs is not None else None,
+        "clearance_mm": _num("clearance_mm"),
+    }
+
+
+def _wp_rack_fields(row):
+    """数据库工件行 → racking 引擎使用的吊具字段 dict。"""
+    return {
+        "cg_offset_x_mm": row["cg_offset_x_mm"] or 0.0,
+        "cg_offset_y_mm": row["cg_offset_y_mm"] or 0.0,
+        "allowed_rotations_deg": (json.loads(row["allowed_rotations"])
+                                  if row["allowed_rotations"] else None),
+        "lift_points_mm": (json.loads(row["lift_points_json"])
+                           if row["lift_points_json"] else None),
+        "clearance_mm": row["clearance_mm"] or 0.0,
     }
 
 
@@ -778,6 +954,11 @@ def trial():
                                "hanger_spacing_mm", "hanger_max_load_kg") if k not in ov]
         if missing:
             return _err(400, f"炉膛参数缺少字段: {missing}")
+        # 挂杆/吊点/横梁模型先构建一次：结构非法（重复挂杆、未知轴等）立即拒绝
+        try:
+            racking.build_rack(ov)
+        except ValueError as e:
+            return _err(400, f"炉 {ov.get('id')} 吊具模型无效: {e}")
         row = {
             "id": ov["id"],
             "chamber_l_mm": float(ov["chamber_l_mm"]),
@@ -790,6 +971,8 @@ def trial():
             "hanger_slots": int(ov["hanger_slots"]),
             "hanger_spacing_mm": float(ov["hanger_spacing_mm"]),
             "hanger_max_load_kg": float(ov["hanger_max_load_kg"]),
+            # 挂杆/吊点坐标/单点限载/分区载荷/偏载容差（随版本参数快照存档）
+            "hanger_rack": ov.get("hanger_rack"),
         }
         db.execute(
             "INSERT INTO ovens (id, chamber_l_mm, chamber_w_mm, chamber_h_mm,"
@@ -807,7 +990,7 @@ def trial():
             " hanger_slots=excluded.hanger_slots,"
             " hanger_spacing_mm=excluded.hanger_spacing_mm,"
             " hanger_max_load_kg=excluded.hanger_max_load_kg",
-            row,
+            {k: v for k, v in row.items() if k != "hanger_rack"},
         )
         oven_rows.append(row)
 
@@ -820,6 +1003,16 @@ def trial():
     windows_by_oven = {}
     for w in blackouts:
         windows_by_oven.setdefault(w["oven_id"], []).append(w)
+
+    # 吊点禁用时段（临时封掉的挂位）：未知炉号/挂杆/吊点、倒序一律拒绝
+    try:
+        hanger_blackouts = _parse_hanger_blackouts(
+            data.get("hanger_blackouts", []), oven_rows)
+    except ValueError as e:
+        return _err(400, str(e))
+    hb_by_oven = {}
+    for hb in hanger_blackouts:
+        hb_by_oven.setdefault(hb["oven_id"], []).append(hb)
 
     # 粉料主数据 upsert
     powder_req = []
@@ -861,18 +1054,32 @@ def trial():
                 })
                 continue
             due = _parse_dt(o["due_at"], "due_at").isoformat() if o.get("due_at") else None
+            try:
+                rk = _wp_kwargs(o)
+            except ValueError as e:
+                return _err(400, f"工件 {o['workpiece_id']} 吊具参数无效: {e}")
             db.execute(
                 "INSERT INTO workpieces (id, order_id, length_mm, width_mm, height_mm,"
-                " weight_kg, powder_batch, compat_group, due_at, status)"
-                " VALUES (?,?,?,?,?,?,?,?,?,'PENDING')"
+                " weight_kg, powder_batch, compat_group, due_at, status,"
+                " cg_offset_x_mm, cg_offset_y_mm, allowed_rotations,"
+                " lift_points_json, clearance_mm)"
+                " VALUES (?,?,?,?,?,?,?,?,?,'PENDING',?,?,?,?,?)"
                 " ON CONFLICT(id) DO UPDATE SET"
                 " order_id=excluded.order_id, length_mm=excluded.length_mm,"
                 " width_mm=excluded.width_mm, height_mm=excluded.height_mm,"
                 " weight_kg=excluded.weight_kg, powder_batch=excluded.powder_batch,"
-                " compat_group=excluded.compat_group, due_at=excluded.due_at",
+                " compat_group=excluded.compat_group, due_at=excluded.due_at,"
+                " cg_offset_x_mm=excluded.cg_offset_x_mm,"
+                " cg_offset_y_mm=excluded.cg_offset_y_mm,"
+                " allowed_rotations=excluded.allowed_rotations,"
+                " lift_points_json=excluded.lift_points_json,"
+                " clearance_mm=excluded.clearance_mm",
                 (o["workpiece_id"], o.get("order_id"), float(o["length_mm"]),
                  float(o["width_mm"]), float(o["height_mm"]), float(o["weight_kg"]),
-                 o["powder_batch"], o.get("compat_group"), due),
+                 o["powder_batch"], o.get("compat_group"), due,
+                 rk["cg_offset_x_mm"], rk["cg_offset_y_mm"],
+                 rk["allowed_rotations"], rk["lift_points_json"],
+                 rk["clearance_mm"]),
             )
     except ValueError as e:
         return _err(400, str(e))
@@ -897,6 +1104,8 @@ def trial():
         "powders": powder_req,
         # 停机窗随版本快照存档，后续试算可整体改写
         "blackout_windows": [_window_json(w) for w in blackouts],
+        # 吊点禁用时段（临时封位）随版本快照存档
+        "hanger_blackouts": [_point_blackout_json(h) for h in hanger_blackouts],
     }
     cur = db.execute(
         "INSERT INTO schedule_versions (parent_id, reason, params_json, created_at)"
@@ -913,6 +1122,16 @@ def trial():
              w["start_at"].isoformat(timespec="seconds"),
              w["end_at"].isoformat(timespec="seconds"),
              w.get("note"), _now().isoformat()),
+    )
+    for hb in hanger_blackouts:
+        db.execute(
+            "INSERT INTO hanger_blackouts (version_id, oven_id, rod_id,"
+            " point_index, start_at, end_at, kind, note, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (version_id, hb["oven_id"], hb["rod_id"], hb["point_index"],
+             hb["start_at"].isoformat(timespec="seconds"),
+             hb["end_at"].isoformat(timespec="seconds") if hb["end_at"] else None,
+             HANGER_BLACKOUT, hb.get("note"), _now().isoformat()),
     )
 
     # 已签发/在炉炉次占用炉膛到计划出炉+周转，编排时避让
@@ -932,12 +1151,22 @@ def trial():
                   for r in db.execute("SELECT * FROM powders").fetchall()}
     # 本次提交因未登记粉料被拒的工件：不得按库内残留旧粉料参与本次编排
     rejected_ids = {u["workpiece_id"] for u in pre_unscheduled}
-    pending = [dict(r) for r in db.execute(
-        "SELECT * FROM workpieces WHERE status='PENDING' ORDER BY id").fetchall()
-        if r["id"] not in rejected_ids]
+    pending = []
+    for r in db.execute(
+            "SELECT * FROM workpieces WHERE status='PENDING' ORDER BY id").fetchall():
+        if r["id"] in rejected_ids:
+            continue
+        wd = dict(r)
+        wd.update(_wp_rack_fields(r))
+        pending.append(wd)
+    # 吊具布置：挂杆/吊点模型 + 试算级禁用时段 + 未修复吊点故障（持续生效）
+    racks = _racks_for(oven_rows)
+    active_faults = _active_faults(db)
+    point_blackouts = _merge_point_blackouts(hb_by_oven, active_faults)
     planned, unscheduled = scheduler.build_plan(
         pending, powder_all, oven_rows, forbidden, start_at, busy_until,
-        blackouts=windows_by_oven)
+        blackouts=windows_by_oven, point_blackouts=point_blackouts,
+        racks=racks)
 
     new_batches = []
     for b in planned:
@@ -951,24 +1180,39 @@ def trial():
             "INSERT INTO batches (version_id, oven_id, state, window_min_c, window_max_c,"
             " hold_minutes, total_weight_kg, heatup_minutes, planned_load_at,"
             " planned_cure_start_at, planned_unload_at, blackout_wait_minutes,"
-            " schedule_basis_json, created_at)"
-            " VALUES (?,?,'DRAFT',?,?,?,?,?,?,?,?,?,?,?)",
+            " schedule_basis_json, arrangement_json, created_at)"
+            " VALUES (?,?,'DRAFT',?,?,?,?,?,?,?,?,?,?,?,?)",
             (version_id, b["oven_id"], b["window_min_c"], b["window_max_c"],
              b["hold_minutes"], b["total_weight_kg"], b["heatup_minutes"],
              b["planned_load_at"], b["planned_cure_start_at"], b["planned_unload_at"],
              b["blackout_wait_minutes"], json.dumps(basis, ensure_ascii=False),
+             json.dumps(b["rack_layout"], ensure_ascii=False),
              _now().isoformat()),
         )
         bid = cur.lastrowid
         for it in b["items"]:
             db.execute(
-                "INSERT INTO batch_items (batch_id, workpiece_id, hanger_slot, slots_used)"
-                " VALUES (?,?,?,?)",
-                (bid, it["workpiece_id"], it["hanger_slot"], it["slots_used"]),
+                "INSERT INTO batch_items (batch_id, workpiece_id, hanger_slot,"
+                " slots_used, rod_id, load_in_sequence, placement_json)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (bid, it["workpiece_id"], it["hanger_slot"], it["slots_used"],
+                 it["placement"]["rod_id"], it["load_in_sequence"],
+                 json.dumps(it["placement"], ensure_ascii=False)),
             )
             db.execute("UPDATE workpieces SET status='SCHEDULED' WHERE id=?",
                        (it["workpiece_id"],))
         new_batches.append({"batch_id": bid, "state": "DRAFT", **b})
+    # 放不下工件的首个冲突约束 / 逐炉拒绝明细 / 可选炉随版本存档
+    for u in unscheduled:
+        db.execute(
+            "INSERT INTO schedule_rejections (version_id, workpiece_id, reason,"
+            " detail, first_conflict_json, per_oven_json, alternative_ovens_json,"
+            " created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (version_id, u["workpiece_id"], u["reason"], u.get("detail"),
+             json.dumps(u.get("first_conflict"), ensure_ascii=False),
+             json.dumps(u.get("per_oven", []), ensure_ascii=False),
+             json.dumps(u.get("alternative_ovens", []), ensure_ascii=False),
+             _now().isoformat()))
     db.commit()
 
     carried = db.execute(
@@ -978,6 +1222,8 @@ def trial():
     turnaround_by_oven = {ov["id"]: float(ov["turnaround_minutes"])
                           for ov in oven_rows}
     conflicts = _blackout_conflicts(carried, windows_by_oven, turnaround_by_oven)
+    # 吊点禁用/故障撞上已签发/在炉炉次的冻结布置：只告警，炉次与吊点都不改
+    hanger_conflicts = _hanger_conflicts(db, carried, point_blackouts)
     return jsonify({
         "version": {"id": version_id, "parent_id": parent["id"] if parent else None,
                     "reason": data.get("reason", "")},
@@ -986,9 +1232,329 @@ def trial():
         "unscheduled": pre_unscheduled + unscheduled,
         "blackout_windows": [_window_json(w) for w in blackouts],
         "blackout_conflicts": conflicts,
+        "hanger_blackouts": [_point_blackout_json(h) for h in hanger_blackouts],
+        "active_point_faults": [_point_blackout_json(w)
+                                for lst in active_faults.values() for w in lst],
+        "hanger_conflicts": hanger_conflicts,
         "oven_timelines": _oven_timelines(oven_rows, carried, new_batches,
                                           windows_by_oven),
     }), 201
+
+
+# ---------------------------------------------------------------- 吊点故障
+
+def _draft_snapshot(db):
+    """重排前各草稿炉次的工件布置（迁移工件/交期变化对照用）。"""
+    snap = {}
+    for r in db.execute(
+            "SELECT b.id AS batch_id, b.oven_id, b.planned_load_at,"
+            " b.planned_unload_at, bi.workpiece_id, bi.rod_id,"
+            " bi.hanger_slot, bi.slots_used"
+            " FROM batches b JOIN batch_items bi ON bi.batch_id=b.id"
+            " WHERE b.state='DRAFT'").fetchall():
+        snap[r["workpiece_id"]] = dict(r)
+    return snap
+
+
+def _migration_report(db, old, new_batches, unscheduled):
+    """吊点故障重排前后对照：迁移工件、挂位/炉号/时刻与交期变化。"""
+    new_pos = {}
+    for b in new_batches:
+        for it in b["items"]:
+            new_pos[it["workpiece_id"]] = b
+    migrations = []
+    for wid, prev in sorted(old.items()):
+        nb = new_pos.get(wid)
+        if nb is None:
+            migrations.append({
+                "workpiece_id": wid, "moved": True,
+                "from_oven_id": prev["oven_id"], "to_oven_id": None,
+                "from_batch_id": prev["batch_id"], "to_batch_id": None,
+                "from_rod_id": prev["rod_id"], "to_rod_id": None,
+                "from_slot": prev["hanger_slot"], "to_slot": None,
+                "planned_unload_at": None,
+                "unload_delta_minutes": None,
+                "detail": "重排后无法布置（见 unscheduled）"})
+            continue
+        moved = (nb["oven_id"] != prev["oven_id"]
+                 or nb["planned_unload_at"] != prev["planned_unload_at"])
+        # 挂位是否变化（同炉次内由 arrangement 比较）
+        to_item = next(i for i in nb["items"] if i["workpiece_id"] == wid)
+        to_rod = to_item["placement"]["rod_id"]
+        to_slot = to_item["hanger_slot"]
+        if not moved:
+            moved = (to_rod != prev["rod_id"] or to_slot != prev["hanger_slot"])
+        old_dt = _parse_dt(prev["planned_unload_at"], "planned_unload_at")
+        new_dt = _parse_dt(nb["planned_unload_at"], "planned_unload_at")
+        delta = round((new_dt - old_dt).total_seconds() / 60.0, 2)
+        migrations.append({
+            "workpiece_id": wid, "moved": moved,
+            "from_oven_id": prev["oven_id"], "to_oven_id": nb["oven_id"],
+            "from_batch_id": prev["batch_id"],
+            "to_batch_id": nb["batch_id"],
+            "from_rod_id": prev["rod_id"], "to_rod_id": to_rod,
+            "from_slot": prev["hanger_slot"], "to_slot": to_slot,
+            "from_planned_unload_at": prev["planned_unload_at"],
+            "planned_unload_at": nb["planned_unload_at"],
+            "unload_delta_minutes": delta,
+            "late": to_item.get("late", False),
+            "detail": "布置/时刻不变" if not moved
+                      else ("炉号或出炉时刻变化" if delta else "同炉时刻不变，挂位变化")})
+    # 此前不在草稿（PENDING 等）但本次新排入的工件不视为迁移对象
+    return migrations
+
+
+@bp.post("/schedule/point-fault")
+def point_fault():
+    """登记吊点故障并重排：只重排未签发（DRAFT）炉次。
+
+    body: {oven_id, rod_id, point_index, reason, started_at?, end_at?}
+    - 故障跨版本持续生效（hanger_faults，直到 /schedule/point-fault/resolve）；
+    - 已签发/在炉炉次布置冻结：若其占用该吊点，列入 frozen_conflicts 且不动；
+    - 旧草稿作废，按「最新版本炉架参数 + 待排产工件 + 该故障」重新试算生成
+      新版本；响应给出迁移工件（炉号/挂杆/挂位/出炉时刻/交期变化）。
+    """
+    data = request.get_json(silent=True) or {}
+    required = ("oven_id", "rod_id", "point_index", "reason")
+    missing = [k for k in required if k not in data]
+    if missing:
+        return _err(400, f"缺少字段: {missing}")
+    if not str(data.get("reason") or "").strip():
+        return _err(400, "吊点故障必须填写原因 reason")
+    db = get_db()
+    oid = data["oven_id"]
+    rid = str(data["rod_id"])
+    try:
+        idx = int(data["point_index"])
+    except (TypeError, ValueError):
+        return _err(400, f"吊点编号须为整数: {data['point_index']!r}")
+    try:
+        started = (_parse_dt(data["started_at"], "started_at")
+                   if data.get("started_at") else _now())
+        end = (_parse_dt(data["end_at"], "end_at")
+               if data.get("end_at") else None)
+        if end is not None and end <= started:
+            return _err(400, "故障结束时刻不早于开始时刻")
+    except ValueError as e:
+        return _err(400, str(e))
+    # 以最新版本快照中的炉架校验挂杆/吊点存在
+    latest_v = db.execute(
+        "SELECT id, params_json FROM schedule_versions ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    params = json.loads(latest_v["params_json"]) if latest_v else {}
+    oven = next((o for o in params.get("ovens", []) if o["id"] == oid), None)
+    if oven is None:
+        return _err(404, f"最新排产版本中没有炉 {oid}，请先试算该炉")
+    rack = racking.build_rack(oven)
+    if rack.point(rid, idx) is None:
+        return _err(400, f"吊点不存在: 炉 {oid} 挂杆 {rid} 编号 {idx}")
+    # 重复登记同一未修复故障 → 幂等返回
+    dup = db.execute(
+        "SELECT * FROM hanger_faults WHERE oven_id=? AND rod_id=?"
+        " AND point_index=? AND resolved_at IS NULL",
+        (oid, rid, idx)).fetchone()
+    if dup is not None:
+        return _err(409, "该吊点已有未修复故障登记",
+                    fault_id=dup["id"], reason=dup["reason"],
+                    started_at=dup["started_at"])
+    cur = db.execute(
+        "INSERT INTO hanger_faults (oven_id, rod_id, point_index, reason,"
+        " started_at, created_at) VALUES (?,?,?,?,?,?)",
+        (oid, rid, idx, str(data["reason"]), started.isoformat(),
+         _now().isoformat()))
+    fault_id = cur.lastrowid
+
+    # ---- 基于最新版本参数重建试算（orders 取当前待排产/草稿工件主数据）----
+    old_draft = _draft_snapshot(db)
+    oven_rows = params.get("ovens", [])
+    powder_req = params.get("powders", [])
+    forbidden = set(tuple(p) for p in params.get("forbidden_pairs", []))
+    start_at = _parse_dt(params["start_at"], "start_at") \
+        if params.get("start_at") else _now()
+    try:
+        blackouts = _parse_blackouts(params.get("blackout_windows", []),
+                                     {o["id"] for o in oven_rows})
+        version_hb = _parse_hanger_blackouts(
+            params.get("hanger_blackouts", []), oven_rows)
+    except ValueError as e:
+        return _err(400, f"上一版本快照参数无法重算: {e}")
+    # 旧草稿作废，工件回到待排产（与试算一致）
+    for d in db.execute("SELECT id FROM batches WHERE state='DRAFT'").fetchall():
+        db.execute("UPDATE batches SET state='SUPERSEDED' WHERE id=?", (d["id"],))
+        db.execute(
+            "UPDATE workpieces SET status='PENDING' WHERE status='SCHEDULED'"
+            " AND id IN (SELECT workpiece_id FROM batch_items WHERE batch_id=?)",
+            (d["id"],))
+    snapshot = {
+        "reason": f"吊点故障重排: 炉 {oid} 挂杆 {rid} 吊点 {idx}（{data['reason']}）",
+        "start_at": start_at.isoformat(),
+        "forbidden_pairs": sorted(list(p) for p in forbidden),
+        "ovens": oven_rows, "powders": powder_req,
+        "blackout_windows": params.get("blackout_windows", []),
+        "hanger_blackouts": params.get("hanger_blackouts", []),
+        "trigger": {"type": "POINT_FAULT", "fault_id": fault_id,
+                    "oven_id": oid, "rod_id": rid, "point_index": idx},
+    }
+    vcur = db.execute(
+        "INSERT INTO schedule_versions (parent_id, reason, params_json, created_at)"
+        " VALUES (?,?,?,?)",
+        (latest_v["id"] if latest_v else None, snapshot["reason"],
+         json.dumps(snapshot, ensure_ascii=False), _now().isoformat()))
+    version_id = vcur.lastrowid
+    for w in blackouts:
+        db.execute(
+            "INSERT INTO blackout_windows (version_id, oven_id, kind, start_at,"
+            " end_at, note, created_at) VALUES (?,?,?,?,?,?,?)",
+            (version_id, w["oven_id"], w["kind"],
+             w["start_at"].isoformat(timespec="seconds"),
+             w["end_at"].isoformat(timespec="seconds"),
+             w.get("note"), _now().isoformat()))
+    # 试算级吊点禁用与全部未修复故障（含本次）都写入版本快照
+    all_faults = _active_faults(db)
+    for hb in version_hb:
+        db.execute(
+            "INSERT INTO hanger_blackouts (version_id, oven_id, rod_id,"
+            " point_index, start_at, end_at, kind, note, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (version_id, hb["oven_id"], hb["rod_id"], hb["point_index"],
+             hb["start_at"].isoformat(timespec="seconds"),
+             hb["end_at"].isoformat(timespec="seconds") if hb["end_at"] else None,
+             HANGER_BLACKOUT, hb.get("note"), _now().isoformat()))
+    for flst in all_faults.values():
+        for pb in flst:
+            link = (fault_id if pb["oven_id"] == oid and pb["rod_id"] == rid
+                    and pb["point_index"] == idx
+                    and pb["start_at"] == started else None)
+            db.execute(
+                "INSERT INTO hanger_blackouts (version_id, fault_id, oven_id,"
+                " rod_id, point_index, start_at, end_at, kind, note, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (version_id, link,
+                 pb["oven_id"], pb["rod_id"], pb["point_index"],
+                 pb["start_at"].isoformat(timespec="seconds"), None,
+                 HANGER_FAULT, pb.get("note"), _now().isoformat()))
+
+    busy_until = {}
+    for c in db.execute(
+            "SELECT oven_id, planned_unload_at FROM batches"
+            " WHERE state IN ('ISSUED','IN_OVEN')").fetchall():
+        until = _parse_dt(c["planned_unload_at"], "planned_unload_at")
+        ov = db.execute("SELECT turnaround_minutes FROM ovens WHERE id=?",
+                        (c["oven_id"],)).fetchone()
+        if ov:
+            until += timedelta(minutes=ov["turnaround_minutes"])
+        if c["oven_id"] not in busy_until or until > busy_until[c["oven_id"]]:
+            busy_until[c["oven_id"]] = until
+    powder_all = {r["batch_no"]: dict(r)
+                  for r in db.execute("SELECT * FROM powders").fetchall()}
+    pending = []
+    for r in db.execute(
+            "SELECT * FROM workpieces WHERE status='PENDING' ORDER BY id").fetchall():
+        wd = dict(r)
+        wd.update(_wp_rack_fields(r))
+        pending.append(wd)
+    racks = _racks_for(oven_rows)
+    windows_by_oven = {}
+    for w in blackouts:
+        windows_by_oven.setdefault(w["oven_id"], []).append(w)
+    planned, unscheduled = scheduler.build_plan(
+        pending, powder_all, oven_rows, forbidden, started, busy_until,
+        blackouts=windows_by_oven, point_blackouts=all_faults, racks=racks)
+
+    new_batches = []
+    for b in planned:
+        basis = {k: b[k] for k in (
+            "baseline_load_at", "baseline_unload_at", "blackout_wait_minutes",
+            "avoided_windows", "earliest_due_at", "lateness_minutes",
+            "baseline_lateness_minutes", "lateness_delta_minutes",
+            "turnaround_end_at")}
+        cc = db.execute(
+            "INSERT INTO batches (version_id, oven_id, state, window_min_c,"
+            " window_max_c, hold_minutes, total_weight_kg, heatup_minutes,"
+            " planned_load_at, planned_cure_start_at, planned_unload_at,"
+            " blackout_wait_minutes, schedule_basis_json, arrangement_json,"
+            " created_at) VALUES (?,?,'DRAFT',?,?,?,?,?,?,?,?,?,?,?,?)",
+            (version_id, b["oven_id"], b["window_min_c"], b["window_max_c"],
+             b["hold_minutes"], b["total_weight_kg"], b["heatup_minutes"],
+             b["planned_load_at"], b["planned_cure_start_at"],
+             b["planned_unload_at"], b["blackout_wait_minutes"],
+             json.dumps(basis, ensure_ascii=False),
+             json.dumps(b["rack_layout"], ensure_ascii=False),
+             _now().isoformat()))
+        nbid = cc.lastrowid
+        for it in b["items"]:
+            db.execute(
+                "INSERT INTO batch_items (batch_id, workpiece_id, hanger_slot,"
+                " slots_used, rod_id, load_in_sequence, placement_json)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (nbid, it["workpiece_id"], it["hanger_slot"], it["slots_used"],
+                 it["placement"]["rod_id"], it["load_in_sequence"],
+                 json.dumps(it["placement"], ensure_ascii=False)))
+            db.execute("UPDATE workpieces SET status='SCHEDULED' WHERE id=?",
+                       (it["workpiece_id"],))
+        new_batches.append({"batch_id": nbid, "state": "DRAFT", **b})
+    for u in unscheduled:
+        db.execute(
+            "INSERT INTO schedule_rejections (version_id, workpiece_id, reason,"
+            " detail, first_conflict_json, per_oven_json, alternative_ovens_json,"
+            " created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (version_id, u["workpiece_id"], u["reason"], u.get("detail"),
+             json.dumps(u.get("first_conflict"), ensure_ascii=False),
+             json.dumps(u.get("per_oven", []), ensure_ascii=False),
+             json.dumps(u.get("alternative_ovens", []), ensure_ascii=False),
+             _now().isoformat()))
+    db.commit()
+
+    carried = db.execute(
+        "SELECT id, oven_id, state, planned_load_at, planned_unload_at FROM batches"
+        " WHERE state IN ('ISSUED','IN_OVEN') ORDER BY id").fetchall()
+    frozen = _hanger_conflicts(db, carried, all_faults)
+    migrations = _migration_report(db, old_draft, new_batches, unscheduled)
+    return jsonify({
+        "fault": {"fault_id": fault_id, "oven_id": oid, "rod_id": rid,
+                  "point_index": idx, "reason": data["reason"],
+                  "started_at": started.isoformat(timespec="seconds")},
+        "version": {"id": version_id,
+                    "parent_id": latest_v["id"] if latest_v else None,
+                    "reason": snapshot["reason"]},
+        "carried_batches": [dict(c) for c in carried],
+        "new_batches": new_batches,
+        "unscheduled": unscheduled,
+        "frozen_conflicts": frozen,
+        "migrations": migrations,
+    }), 201
+
+
+@bp.post("/schedule/point-fault/<int:fault_id>/resolve")
+def resolve_point_fault(fault_id):
+    """修复吊点故障：标记 resolved，之后试算不再禁用该吊点（历史记录保留）。"""
+    db = get_db()
+    f = db.execute("SELECT * FROM hanger_faults WHERE id=?",
+                   (fault_id,)).fetchone()
+    if f is None:
+        return _err(404, f"吊点故障 {fault_id} 不存在")
+    if f["resolved_at"] is not None:
+        return _err(409, "该吊点故障已修复", resolved_at=f["resolved_at"])
+    data = request.get_json(silent=True) or {}
+    at = _parse_dt(data["at"], "at") if data.get("at") else _now()
+    db.execute("UPDATE hanger_faults SET resolved_at=?, resolve_note=? WHERE id=?",
+               (at.isoformat(), data.get("note"), fault_id))
+    db.commit()
+    return jsonify({"fault_id": fault_id, "resolved_at": at.isoformat(),
+                    "note": data.get("note")})
+
+
+@bp.get("/schedule/point-faults")
+def list_point_faults():
+    """吊点故障清单（active=仅未修复，默认全部）。"""
+    db = get_db()
+    active = request.args.get("active", "1") != "0"
+    sql = ("SELECT id, oven_id, rod_id, point_index, reason, started_at,"
+           " resolved_at, resolve_note FROM hanger_faults")
+    if active:
+        sql += " WHERE resolved_at IS NULL"
+    sql += " ORDER BY id"
+    return jsonify({"faults": [dict(r) for r in db.execute(sql).fetchall()]})
 
 
 # ---------------------------------------------------------------- 状态机动作
@@ -1126,6 +1692,176 @@ def issue(bid):
     db.execute("UPDATE batches SET state='ISSUED' WHERE id=?", (bid,))
     db.commit()
     return jsonify({"batch_id": bid, "state": "ISSUED"})
+
+
+def _batch_rack(db, b):
+    """按炉次所属版本快照的炉架参数构建 Rack（人工布置复核/吊点故障复用）。"""
+    v = db.execute("SELECT params_json FROM schedule_versions WHERE id=?",
+                   (b["version_id"],)).fetchone()
+    params = json.loads(v["params_json"]) if v and v["params_json"] else {}
+    oven = next((o for o in params.get("ovens", [])
+                 if o["id"] == b["oven_id"]), None)
+    if oven is None:
+        oven = db.execute("SELECT * FROM ovens WHERE id=?",
+                          (b["oven_id"],)).fetchone()
+        oven = dict(oven) if oven else None
+    if oven is None:
+        return None
+    return racking.build_rack(oven), oven
+
+
+def _arrangement_violations(db, b, rack, assignments, point_blackouts=None):
+    """对人工布置逐条复核：净距/共享吊点/单点/分区/总载/力矩/重心/吊耳。
+
+    assignments: [{workpiece_id, rod_id, point_indices, rotation_deg?}]。
+    返回 (violations, layout, placement_map)；全部通过时 violations 为空。
+    工件主数据取签发快照（已签发炉次）或当前主数据（草稿）。
+    """
+    frozen = b["state"] not in ("DRAFT", "SUPERSEDED")
+    rows = db.execute(
+        "SELECT bi.workpiece_id,"
+        " COALESCE(bi.snap_length_mm, w.length_mm) AS length_mm,"
+        " COALESCE(bi.snap_width_mm, w.width_mm) AS width_mm,"
+        " COALESCE(bi.snap_height_mm, w.height_mm) AS height_mm,"
+        " COALESCE(bi.snap_weight_kg, w.weight_kg) AS weight_kg,"
+        " w.cg_offset_x_mm, w.cg_offset_y_mm, w.allowed_rotations,"
+        " w.lift_points_json, w.clearance_mm"
+        " FROM batch_items bi JOIN workpieces w ON w.id=bi.workpiece_id"
+        " WHERE bi.batch_id=?", (b["id"],)).fetchall()
+    wp_by_id = {r["workpiece_id"]: r for r in rows}
+    by_wp = {a.get("workpiece_id"): a for a in assignments}
+    violations = []
+    # 工件集合必须与炉内一致（不多不少）
+    missing = sorted(set(wp_by_id) - set(by_wp))
+    extra = sorted(set(by_wp) - set(wp_by_id))
+    if missing:
+        violations.append({"code": "ITEMS_MISSING", "workpiece_id": None,
+                           "detail": f"缺少工件的人工布置: {missing}"})
+    if extra:
+        violations.append({"code": "ITEMS_EXTRA", "workpiece_id": None,
+                           "detail": f"炉次中不存在的工件: {extra}"})
+    point_blackouts = point_blackouts or {}
+    layout = racking._Layout(rack)
+    placement_map = {}
+    # 按搬入顺序（rod y 降序、x 升序）应用，保证净距检查确定
+    ordered = sorted(
+        [a for a in assignments if a.get("workpiece_id") in wp_by_id],
+        key=lambda a: (str(a.get("rod_id")),
+                       min(int(i) for i in a.get("point_indices", [0])),
+                       a.get("workpiece_id")))
+    blocked = {(pb["rod_id"], pb["point_index"])
+               for pb in point_blackouts.get(b["oven_id"], [])}
+    for a in ordered:
+        wid = a["workpiece_id"]
+        r = wp_by_id[wid]
+        rid = str(a.get("rod_id"))
+        rod = rack.rod(rid)
+        if rod is None:
+            violations.append({"code": "UNKNOWN_ROD", "workpiece_id": wid,
+                               "rod_id": rid, "detail": f"挂杆 {rid} 不存在"})
+            continue
+        try:
+            indices = [int(i) for i in a["point_indices"]]
+        except (KeyError, TypeError, ValueError):
+            violations.append({"code": "BAD_POINTS", "workpiece_id": wid,
+                               "rod_id": rid, "detail": "point_indices 须为整数数组"})
+            continue
+        if len(set(indices)) != len(indices) or not indices:
+            violations.append({"code": "BAD_POINTS", "workpiece_id": wid,
+                               "rod_id": rid, "detail": "吊点编号重复或为空"})
+            continue
+        pts = [rack.point(rid, i) for i in indices]
+        if any(p is None for p in pts):
+            bad = indices[[j for j, p in enumerate(pts) if p is None][0]]
+            violations.append({"code": "UNKNOWN_POINT", "workpiece_id": wid,
+                               "rod_id": rid, "point_index": bad,
+                               "detail": f"挂杆 {rid} 无吊点 {bad}"})
+            continue
+        if sorted(indices) != list(range(min(indices), max(indices) + 1)):
+            violations.append({"code": "NON_CONTIGUOUS", "workpiece_id": wid,
+                               "rod_id": rid, "point_index": min(indices),
+                               "detail": "占用吊点必须编号连续"})
+            continue
+        wp = {"id": wid, "length_mm": r["length_mm"], "width_mm": r["width_mm"],
+              "height_mm": r["height_mm"], "weight_kg": r["weight_kg"],
+              "powder_batch": r["workpiece_id"],
+              "cg_offset_x_mm": r["cg_offset_x_mm"] or 0.0,
+              "cg_offset_y_mm": r["cg_offset_y_mm"] or 0.0,
+              "allowed_rotations_deg": (json.loads(r["allowed_rotations"])
+                                        if r["allowed_rotations"] else None),
+              "lift_points_mm": (json.loads(r["lift_points_json"])
+                                 if r["lift_points_json"] else None),
+              "clearance_mm": r["clearance_mm"] or 0.0}
+        if "rotation_deg" in a and a["rotation_deg"] is not None:
+            wp["allowed_rotations_deg"] = [int(a["rotation_deg"])]
+        # 手工指定具体吊点：在复制的挂杆布局上只允许这一段
+        res = layout.try_place_manual(wp, rid, indices, blocked=blocked)
+        if "wp" not in res:
+            violations.append({"workpiece_id": wid, "rod_id": rid,
+                               "point_index": res.get("point_index"),
+                               "code": res["conflict"],
+                               "detail": res.get("detail", "")})
+            continue
+        layout.commit(res)
+        placement_map[wid] = res
+    return violations, layout, placement_map
+
+
+@bp.post("/batches/<int:bid>/arrangement/verify")
+def verify_arrangement(bid):
+    """人工调整吊具布置后复核：只校验，不落库（check_only）或校验通过后采用。
+
+    body: {"assignments":[{"workpiece_id","rod_id","point_indices",
+                           "rotation_deg"?}], "apply": true/false}
+    - 炉次须为 DRAFT 才能采用（apply=true）；签发后布置冻结，只可 check_only；
+    - 逐条返回违反的约束（净距/共享吊点/单点承重/分区/总载/力矩/重心/吊耳/
+      禁用吊点），任一不通过即 409 且不改动任何数据。
+    """
+    db = get_db()
+    b = _fetch_batch(db, bid)
+    if b is None:
+        return _err(404, f"炉次 {bid} 不存在")
+    data = request.get_json(silent=True) or {}
+    assignments = data.get("assignments")
+    if not isinstance(assignments, list) or not assignments:
+        return _err(400, "缺少 assignments 数组（工件→挂杆/吊点）")
+    apply_it = bool(data.get("apply"))
+    built = _batch_rack(db, b)
+    if built is None:
+        return _err(404, f"炉次 {bid} 的炉架参数缺失（版本快照无该炉）")
+    rack, _oven = built
+    if apply_it and b["state"] != "DRAFT":
+        return _err(409, f"炉次状态为 {b['state']}，布置已冻结；"
+                         "仅草稿炉次可采用人工布置（可去掉 apply 仅复核）",
+                    state=b["state"])
+    # 复核时计入当前未修复吊点故障（冻结炉次也会显示其影响）
+    point_blackouts = _active_faults(db)
+    violations, layout, placement_map = _arrangement_violations(
+        db, b, rack, assignments, point_blackouts=point_blackouts)
+    report = layout.report()
+    if violations:
+        return _err(409, "人工布置未通过吊具校验",
+                    violations=violations,
+                    load_balance=report["load_balance"])
+    if apply_it:
+        report["oven_id"] = b["oven_id"]
+        db.execute("UPDATE batches SET arrangement_json=? WHERE id=?",
+                   (json.dumps(report, ensure_ascii=False), bid))
+        for wid, plc in placement_map.items():
+            pview = racking.placement_view(plc, rack)
+            seq = {s["workpiece_id"]: s["sequence"]
+                   for s in report["load_in_sequence"]}
+            db.execute(
+                "UPDATE batch_items SET rod_id=?, hanger_slot=?, slots_used=?,"
+                " load_in_sequence=?, placement_json=?"
+                " WHERE batch_id=? AND workpiece_id=?",
+                (plc["rod_id"], plc["run"][0]["index"], len(plc["run"]),
+                 seq[wid], json.dumps(pview, ensure_ascii=False), bid, wid))
+        db.commit()
+    return jsonify({"batch_id": bid, "state": b["state"],
+                    "applied": apply_it,
+                    "valid": True, "rack_layout": report,
+                    "load_in_sequence": report["load_in_sequence"]})
 
 
 @bp.post("/batches/<int:bid>/load")

@@ -47,6 +47,13 @@ CREATE TABLE IF NOT EXISTS workpieces (
     status       TEXT NOT NULL DEFAULT 'PENDING',
     -- PENDING 待排产 / SCHEDULED 已排入炉次 / IN_OVEN 在炉
     -- DONE 判定合格 / REWORK_PENDING 待返工 / CLOSED 已结案
+    -- 吊具布置：重心相对工件几何中心的沿杆/横向偏移、可旋转方向、
+    -- 吊耳沿长轴坐标（相对工件中心）、与相邻工件的要求净距
+    cg_offset_x_mm REAL NOT NULL DEFAULT 0,
+    cg_offset_y_mm REAL NOT NULL DEFAULT 0,
+    allowed_rotations TEXT,           -- JSON [0,90]，NULL 按默认可旋转方向
+    lift_points_json  TEXT,           -- JSON [-1000,1000]，NULL 为均布承重
+    clearance_mm      REAL NOT NULL DEFAULT 0,
     note         TEXT
 );
 
@@ -70,6 +77,7 @@ CREATE TABLE IF NOT EXISTS batches (
     -- 停机避让：因避让停机窗增加的等待分钟；schedule_basis_json 为完整计算依据
     blackout_wait_minutes REAL NOT NULL DEFAULT 0,
     schedule_basis_json   TEXT,
+    arrangement_json      TEXT,   -- 吊具布置完整报告（坐标/载荷/力矩/搬入顺序），签发时冻结
     created_at            TEXT NOT NULL
 );
 
@@ -88,8 +96,11 @@ CREATE TABLE IF NOT EXISTS blackout_windows (
 CREATE TABLE IF NOT EXISTS batch_items (
     batch_id     INTEGER NOT NULL REFERENCES batches(id),
     workpiece_id TEXT NOT NULL REFERENCES workpieces(id),
-    hanger_slot  INTEGER NOT NULL,   -- 起始挂位（1 起）
+    hanger_slot  INTEGER NOT NULL,   -- 起始挂位（1 起，挂杆局部编号）
     slots_used   INTEGER NOT NULL,   -- 占用挂位数
+    rod_id       TEXT,               -- 所在挂杆
+    load_in_sequence INTEGER,        -- 搬入顺序（1 起）
+    placement_json TEXT,             -- 吊点坐标/旋转/各点载荷/重心（签发时冻结）
     -- 签发时快照：工件尺寸/重量与粉料固化窗口；签发后不再随主数据变化
     snap_length_mm    REAL,
     snap_width_mm     REAL,
@@ -202,6 +213,49 @@ CREATE TABLE IF NOT EXISTS flags (
     created_at   TEXT NOT NULL,
     UNIQUE (batch_id, workpiece_id, code)
 );
+
+-- 吊点故障登记（持续到修复）；签发后冻结的炉次不得改动，只重排未签发炉次
+CREATE TABLE IF NOT EXISTS hanger_faults (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    oven_id     TEXT NOT NULL,
+    rod_id      TEXT NOT NULL,
+    point_index INTEGER NOT NULL,
+    reason      TEXT NOT NULL,
+    started_at  TEXT NOT NULL,
+    resolved_at TEXT,
+    resolve_note TEXT,
+    created_at  TEXT NOT NULL
+);
+
+-- 吊点禁用时段（清炉/检修时临时封掉的挂位 + 吊点故障登记）：
+-- version_id 非空 = 随试算版本快照的试算级禁用；fault_id 非空 = 持续生效的
+-- 吊点故障（跨版本，直到修复）。resolved_at 非空表示故障已修复。
+CREATE TABLE IF NOT EXISTS hanger_blackouts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    version_id  INTEGER REFERENCES schedule_versions(id),
+    fault_id    INTEGER REFERENCES hanger_faults(id),
+    oven_id     TEXT NOT NULL,
+    rod_id      TEXT NOT NULL,
+    point_index INTEGER NOT NULL,
+    start_at    TEXT NOT NULL,
+    end_at      TEXT,                  -- NULL = 开放结束（故障持续中）
+    kind        TEXT NOT NULL,         -- BLACKOUT 临时封位 / FAULT 吊点故障
+    note        TEXT,
+    created_at  TEXT NOT NULL
+);
+
+-- 试算时放不下的工件：首个冲突约束 / 逐炉拒绝明细 / 可选炉（随版本存档）
+CREATE TABLE IF NOT EXISTS schedule_rejections (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    version_id  INTEGER NOT NULL REFERENCES schedule_versions(id),
+    workpiece_id TEXT NOT NULL,
+    reason      TEXT NOT NULL,
+    detail      TEXT,
+    first_conflict_json TEXT,
+    per_oven_json       TEXT,
+    alternative_ovens_json TEXT,
+    created_at  TEXT NOT NULL
+);
 """
 
 
@@ -237,7 +291,9 @@ def init_db():
                      "actual_unload_at": "TEXT", "unload_sequence": "INTEGER",
                      "first_met_at": "TEXT", "final_verdict": "TEXT",
                      "forced": "INTEGER NOT NULL DEFAULT 0",
-                     "force_reason": "TEXT", "progress_snapshot_json": "TEXT"}
+                     "force_reason": "TEXT", "progress_snapshot_json": "TEXT",
+                     "rod_id": "TEXT", "load_in_sequence": "INTEGER",
+                     "placement_json": "TEXT"}
     for col, typ in snapshot_cols.items():
         if col not in existing:
             db.execute(f"ALTER TABLE batch_items ADD COLUMN {col} {typ}")
@@ -282,6 +338,20 @@ def init_db():
                      "valid_until": "TEXT", "points_json": "TEXT"}.items():
         if col not in existing:
             db.execute(f"ALTER TABLE batch_item_probes ADD COLUMN {col} {typ}")
+    # 兼容旧库：workpieces 补重心 / 可旋转方向 / 吊耳 / 净距列
+    existing = {r["name"] for r in db.execute("PRAGMA table_info(workpieces)")}
+    wp_new_cols = {"cg_offset_x_mm": "REAL NOT NULL DEFAULT 0",
+                   "cg_offset_y_mm": "REAL NOT NULL DEFAULT 0",
+                   "allowed_rotations": "TEXT",    # JSON [deg,...]
+                   "lift_points_json": "TEXT",     # JSON [mm,...] 吊耳坐标
+                   "clearance_mm": "REAL NOT NULL DEFAULT 0"}
+    for col, typ in wp_new_cols.items():
+        if col not in existing:
+            db.execute(f"ALTER TABLE workpieces ADD COLUMN {col} {typ}")
+    # 兼容旧库：batches 补吊具布置完整报告（签发时冻结）
+    existing = {r["name"] for r in db.execute("PRAGMA table_info(batches)")}
+    if "arrangement_json" not in existing:
+        db.execute("ALTER TABLE batches ADD COLUMN arrangement_json TEXT")
     db.commit()
 
 
