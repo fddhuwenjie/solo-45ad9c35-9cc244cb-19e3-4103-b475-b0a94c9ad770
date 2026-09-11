@@ -217,9 +217,10 @@ def _choose_new_oven(wp, powder, ov_candidates, racks, open_batches, busy_until,
     for ov in ov_candidates:
         rack = racks[ov["id"]]
         candidate = _Batch(ov, rack)
-        pessimistic = {(pb["rod_id"], pb["point_index"])
-                       for pb in point_blackouts.get(ov["id"], [])}
-        res = candidate.can_add(wp, powder, forbidden, blocked=pessimistic)
+        # 选炉时只做空炉可行性试布：吊点禁用只在与该炉次实际占用时段重叠时
+        # 才封点（修复轮按计时区间处理），07:00 已结束的禁用窗不得封掉 08:00
+        # 开排炉次的挂位
+        res = candidate.can_add(wp, powder, forbidden, blocked=set())
         attempts[ov["id"]] = res
         if "wp" not in res:
             continue
@@ -294,6 +295,65 @@ def _place_into(wp, powder, ovens, racks, batches, forbidden, blocked_by_batch,
     return None, attempts
 
 
+def _rebuild_batch_from_placements(batch, wps, powders, placements):
+    """用光束搜索得到的整组布置重建炉次（窗口/保温/总重/禁配组）。"""
+    batch.reset()
+    for wp, plc in zip(wps, placements):
+        batch.add(wp, powders[wp["powder_batch"]], plc)
+
+
+def _enforce_balance(batch, powders, blocked):
+    """对一个炉次按整组方案重排吊点，使左右力矩满足容差。
+
+    保持炉次成员顺序（交期优先的放入顺序）做光束搜索；若整组仍无法平衡，
+    从尾部确定性撤出工件直到剩余前缀平衡，返回撤出工件 wp 列表。
+    未设容差的炉架不做任何处理。
+    """
+    rack = batch.rack
+    if (rack.moment_tolerance_kg_mm is None
+            and rack.moment_tolerance_ratio is None) or not batch.items:
+        return []
+    ordered_wps = [i["wp"] for i in batch.items]
+    for cut in range(len(ordered_wps), 0, -1):
+        prefix = ordered_wps[:cut]
+        empty = racking._Layout(rack)
+        placements, fail_id = empty.balanced_layout(prefix, blocked=blocked)
+        if placements is not None:
+            evicted = ordered_wps[cut:]
+            _rebuild_batch_from_placements(batch, prefix, powders, placements)
+            return evicted
+    # 连首件（单件整组）都无法满足容差：整批撤出并清空炉壳，
+    # 由调用方按 MOMENT 首冲突报 LOAD_BALANCE
+    batch.reset()
+    return list(ordered_wps)
+
+
+def _balance_only_failure(wp, powders, ovens, racks):
+    """队列工件在无禁用吊点的空炉仍无法整组平衡 → (per_oven, first_conflict)。"""
+    per_oven = []
+    first = None
+    for ov in sorted(ovens, key=lambda o: o["id"]):
+        rack = racks[ov["id"]]
+        if (rack.moment_tolerance_kg_mm is None
+                and rack.moment_tolerance_ratio is None):
+            continue
+        empty = racking._Layout(rack)
+        placements, _ = empty.balanced_layout([wp], blocked=set())
+        view = {"oven_id": ov["id"],
+                "code": None if placements is not None else racking.F_MOMENT,
+                "rod_id": None, "point_index": None,
+                "detail": None if placements is not None
+                else "单件整组布置仍超出左右偏载容差"}
+        per_oven.append(view)
+        if placements is None and first is None:
+            first = {"code": racking.F_MOMENT, "oven_id": ov["id"],
+                     "rod_id": None, "point_index": None,
+                     "detail": view["detail"]}
+    if first is None:
+        return None
+    return per_oven, first
+
+
 def build_plan(workpieces, powders, ovens, forbidden_pairs, start_at,
                busy_until=None, blackouts=None, point_blackouts=None,
                racks=None):
@@ -363,11 +423,19 @@ def build_plan(workpieces, powders, ovens, forbidden_pairs, start_at,
 
     timing = _time_all(ovens, batches, start_at, busy_until, blackouts)
 
-    # 修复轮：炉次占用区间与禁用时段相交 → 撤出受影响工件，按各炉次
-    # 真实 blocked 集合重新分组；最后一轮对全部禁用吊点悲观布置保证收敛。
+    # 修复轮：两类问题统一处理——
+    # (a) 炉次占用区间与吊点禁用时段相交 → 撤出占用封点的工件；
+    # (b) 设有力矩容差的炉架按**整组方案**重排光束搜索，放不下平衡的工件
+    #     从炉次撤出（单件偏载不在放入时拒绝），反复无法平衡的件在修复轮
+    #     结束后判 LOAD_BALANCE。
+    # 撤出工件按各炉次真实 blocked 集合重新分组；最后一轮对全部禁用吊点
+    # 悲观布置保证收敛。
     queue = [wp for wp in plannable if wp["id"] in repair_attempts]
+    balance_rejects = {}   # workpiece_id -> 末次整组平衡失败信息
+    balance_failed = set()  # 已判定不可平衡（不再开新批反复搬移）
     for round_no in range(_MAX_ROUNDS):
         pessimistic = round_no == _MAX_ROUNDS - 1
+        timing = _time_all(ovens, batches, start_at, busy_until, blackouts)
         blocked_by_batch = {}
         evict_ids = set()
         affected = set()
@@ -385,24 +453,45 @@ def build_plan(workpieces, powders, ovens, forbidden_pairs, start_at,
                 if used & blk:
                     evict_ids.add(item["wp"]["id"])
                     affected.add(id(b))
-        if not evict_ids and not queue:
+            # 整组力矩平衡（未设容差的炉架保持 first-fit 原布置不动）
+            rack = racks[b.oven["id"]]
+            if (rack.moment_tolerance_kg_mm is not None
+                    or rack.moment_tolerance_ratio is not None):
+                for wp in _enforce_balance(b, powders, blk):
+                    evict_ids.add(wp["id"])
+                    balance_rejects[wp["id"]] = racking.F_MOMENT
+                    affected.add(id(b))
+        # 只剩已判不可平衡的件（不再重放）且无待处理队列时收敛
+        if not (evict_ids - balance_failed) and not queue:
             break
-        # 受影响炉次整批清空（炉壳保留、重置），其工件与待处理队列合并重排
+        # 受影响炉次整批清空（炉壳保留、重置），其工件与待处理队列合并重排。
+        # 注意：平衡撤出时 _enforce_balance 可能已重置炉次，被撤出件以
+        # evict_ids 为准从本轮待排工件中找回，不能只依赖此刻 b.items。
         requeue = list(queue)
         queue = []
         for b in batches:
             if id(b) in affected:
-                for item in b.items:
-                    requeue.append(item["wp"])
+                requeue.extend(item["wp"] for item in b.items)
                 b.reset()
-        # 去重（保持交期优先顺序）
+        known = {w["id"]: w for w in plannable}
+        for w_id in evict_ids:
+            if all(w["id"] != w_id for w in requeue) and w_id in known:
+                requeue.append(known[w_id])
+        # 平衡类撤出件：先判空炉单件整组是否可行；不可平衡者直接标记，
+        # 不再开新批反复搬移（最后统一报 LOAD_BALANCE）
+        for w in requeue:
+            if w["id"] in balance_rejects:
+                bal_fail = _balance_only_failure(w, powders, ovens, racks)
+                if bal_fail is not None:
+                    balance_failed.add(w["id"])
+        # 去重（保持交期优先顺序）；已判定不可平衡的件不再重放
         seen = set()
         deduped = []
         for w in sorted(requeue,
                         key=lambda w: (w.get("due_at") is None,
                                        w.get("due_at") or "",
                                        -w["weight_kg"], w["id"])):
-            if w["id"] in seen:
+            if w["id"] in seen or w["id"] in balance_failed:
                 continue
             seen.add(w["id"])
             deduped.append(w)
@@ -426,12 +515,74 @@ def build_plan(workpieces, powders, ovens, forbidden_pairs, start_at,
                 repair_attempts[wp["id"]] = attempts
         # 删除被清空且重排后仍为空的炉壳
         batches = [b for b in batches if b.items]
-        timing = _time_all(ovens, batches, start_at, busy_until, blackouts)
-        if not queue:
+        # 收敛：本轮无撤出/无新入队，或所有撤出件都已判为不可平衡/入队
+        still_evictable = bool(evict_ids - balance_failed
+                               - {w["id"] for w in queue})
+        if not still_evictable and not queue:
             break
+    timing = _time_all(ovens, batches, start_at, busy_until, blackouts)
 
-    # 仍放不下的工件：首个冲突约束 + 逐炉明细 + 可选炉（硬可行炉）
+    # 修复轮结束：对最终批次再做一次整组平衡，仍无法平衡的件直接判
+    # LOAD_BALANCE（不再开新批）。修复轮中已反复撤出的不可平衡件
+    # （balance_failed）一并汇总，保证既不出现在炉次，也进入 unscheduled。
+    final_balance_evict = []
+    for b in list(batches):
+        rack = racks[b.oven["id"]]
+        if (rack.moment_tolerance_kg_mm is None
+                and rack.moment_tolerance_ratio is None) or not b.items:
+            continue
+        if id(b) not in timing:
+            continue
+        load, _, release, _, _, _ = timing[id(b)]
+        blk = _blocked_for_interval(
+            rack, (load, release), point_blackouts.get(b.oven["id"], []))
+        for wp in _enforce_balance(b, powders, blk):
+            balance_failed.add(wp["id"])
+            final_balance_evict.append((b.oven["id"], wp))
+    batches = [b for b in batches if b.items]
+    wp_by_id = {w["id"]: w for w in plannable}
+    for wid in sorted(balance_failed):
+        wp = wp_by_id.get(wid)
+        if wp is None or wid in {u["workpiece_id"] for u in unscheduled}:
+            continue
+        per_oven = []
+        first = None
+        for ov in sorted(ovens, key=lambda o: o["id"]):
+            rack = racks[ov["id"]]
+            if (rack.moment_tolerance_kg_mm is None
+                    and rack.moment_tolerance_ratio is None):
+                continue
+            empty = racking._Layout(rack)
+            placements, _ = empty.balanced_layout([wp], blocked=set())
+            fail = placements is None
+            view = {"oven_id": ov["id"],
+                    "code": racking.F_MOMENT if fail else None,
+                    "rod_id": None, "point_index": None,
+                    "detail": "单件整组布置仍超出左右偏载容差" if fail else None}
+            per_oven.append(view)
+            if fail and first is None:
+                first = {"code": racking.F_MOMENT, "oven_id": ov["id"],
+                         "rod_id": None, "point_index": None,
+                         "detail": view["detail"]}
+        unscheduled.append({
+            "workpiece_id": wp["id"], "reason": REASON_BALANCE,
+            "detail": "所有可行炉的整组吊具方案均无法满足左右偏载容差",
+            "first_conflict": first, "per_oven": per_oven,
+            "alternative_ovens": wp.get("_feasible_ovens", []),
+        })
     for wp in queue:
+        if wp["id"] in balance_failed:
+            continue
+        bal_fail = _balance_only_failure(wp, powders, ovens, racks)
+        if bal_fail is not None:
+            per_oven, first = bal_fail
+            unscheduled.append({
+                "workpiece_id": wp["id"], "reason": REASON_BALANCE,
+                "detail": "所有可行炉的整组吊具方案均无法满足左右偏载容差",
+                "first_conflict": first, "per_oven": per_oven,
+                "alternative_ovens": wp.get("_feasible_ovens", []),
+            })
+            continue
         attempts = repair_attempts.get(wp["id"], {})
         per_oven = []
         first = None

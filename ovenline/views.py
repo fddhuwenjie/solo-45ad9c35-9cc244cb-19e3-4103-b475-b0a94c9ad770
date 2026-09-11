@@ -1804,6 +1804,27 @@ def _arrangement_violations(db, b, rack, assignments, point_blackouts=None):
             continue
         layout.commit(res)
         placement_map[wid] = res
+    # 整组方案检查（不是逐件看）：单点/分区在放入时已逐件累计检查，这里
+    # 复核横梁总载与左右力矩平衡，给出整组载荷视图
+    bal = layout.balance()
+    if not bal.get("total_ok"):
+        violations.append({
+            "code": "BEAM_TOTAL", "workpiece_id": None,
+            "detail": f"横梁总载 {bal['total_load_kg']:g}/"
+                      f"{bal['beam_limit_kg']:g} kg 超限"})
+    for rod in bal.get("rods", []):
+        for z in rod.get("zones", []):
+            if not z["ok"]:
+                violations.append({
+                    "code": "ZONE_LOAD", "workpiece_id": None,
+                    "rod_id": rod["rod_id"], "point_index": None,
+                    "detail": f"挂杆 {rod['rod_id']} 分区 {z['zone_id']} 承重 "
+                              f"{z['load_kg']:g}/{z['limit_kg']:g} kg 超限"})
+    if not bal.get("moment_ok"):
+        violations.append({
+            "code": "MOMENT", "workpiece_id": None,
+            "detail": f"整组偏载力矩 |{bal['moment_abs_kg_mm']:g}| kg·mm "
+                      "超过左右偏载容差"})
     return violations, layout, placement_map
 
 
@@ -2551,7 +2572,11 @@ def list_versions():
         "SELECT v.id, v.parent_id, v.reason, v.created_at,"
         " (SELECT COUNT(*) FROM batches b WHERE b.version_id = v.id) AS batch_count,"
         " (SELECT COUNT(*) FROM blackout_windows w WHERE w.version_id = v.id)"
-        "   AS blackout_count"
+        "   AS blackout_count,"
+        " (SELECT COUNT(*) FROM hanger_blackouts h WHERE h.version_id = v.id)"
+        "   AS hanger_blackout_count,"
+        " (SELECT COUNT(*) FROM schedule_rejections r WHERE r.version_id = v.id)"
+        "   AS rejection_count"
         " FROM schedule_versions v ORDER BY v.id").fetchall()
     return jsonify({"versions": [dict(r) for r in rows]})
 
@@ -2582,11 +2607,33 @@ def version_detail(vid):
             " blackout_wait_minutes FROM batches WHERE version_id=? ORDER BY id",
             (vid,)).fetchall()
     ]
+    # 版本快照中的吊点禁用（临时封位 + 吊点故障）
+    hb_rows = db.execute(
+        "SELECT oven_id, rod_id, point_index, start_at, end_at, kind, note,"
+        " fault_id FROM hanger_blackouts WHERE version_id=?"
+        " ORDER BY oven_id, rod_id, point_index", (vid,)).fetchall()
+    hanger_blackouts = [dict(r) for r in hb_rows]
+    # 放不下工件的拒绝原因（首个冲突约束 / 逐炉明细 / 可选炉）
+    rejections = [
+        {"workpiece_id": r["workpiece_id"], "reason": r["reason"],
+         "detail": r["detail"],
+         "first_conflict": json.loads(r["first_conflict_json"])
+                           if r["first_conflict_json"] else None,
+         "per_oven": json.loads(r["per_oven_json"]) if r["per_oven_json"] else [],
+         "alternative_ovens": json.loads(r["alternative_ovens_json"])
+                              if r["alternative_ovens_json"] else []}
+        for r in db.execute(
+            "SELECT workpiece_id, reason, detail, first_conflict_json,"
+            " per_oven_json, alternative_ovens_json FROM schedule_rejections"
+            " WHERE version_id=? ORDER BY id", (vid,)).fetchall()
+    ]
     return jsonify({
         "id": v["id"], "parent_id": v["parent_id"], "reason": v["reason"],
         "created_at": v["created_at"],
         "params": params,                # 试算输入快照（计算依据）
         "blackout_windows": windows,     # 该版本登记的停机窗
+        "hanger_blackouts": hanger_blackouts,
+        "rejections": rejections,        # 放不下工件的首个冲突与可选炉
         "batches": batches,
     })
 
@@ -2787,6 +2834,67 @@ def batch_card(bid):
         "</table>"
     ) if p.get("unload_order") else (
         "<h2>逐件离炉记录</h2><p class='small'>尚无工件离炉。</p>")
+    # 吊具布置与载荷平衡：挂杆/吊点坐标、旋转、各点载荷、分区、横梁总载、
+    # 左右力矩与搬入顺序（草稿为当前布置，签发后为冻结快照）
+    rl = p.get("rack_layout")
+    if rl:
+        bal = rl.get("load_balance", {})
+        rod_rows = []
+        for rod in bal.get("rods", []):
+            ztxt = "；".join(
+                f"{z['zone_id']}: {z['load_kg']:g}/{z['limit_kg']:g} kg"
+                + ("" if z["ok"] else " 超限")
+                for z in rod.get("zones", [])) or "-"
+            rod_rows.append(
+                "<tr>"
+                f"<td>{html.escape(str(rod['rod_id']))}</td>"
+                f"<td>{rod['left_load_kg']:g}</td>"
+                f"<td>{rod['right_load_kg']:g}</td>"
+                f"<td>{rod['moment_kg_mm']:+g}</td>"
+                f"<td>{html.escape(ztxt)}</td>"
+                "</tr>")
+        plc_rows = []
+        seq_map = {s["workpiece_id"]: s["sequence"]
+                   for s in rl.get("load_in_sequence", [])}
+        for plc in rl.get("placements", []):
+            pts = "、".join(
+                f"#{pt['index']}({pt['x_mm']:g}, {pt['load_kg']:g}kg"
+                + ("" if pt["bearing"] else ",不承重") + ")"
+                for pt in plc["occupied_points"])
+            plc_rows.append(
+                "<tr>"
+                f"<td>{html.escape(str(plc['workpiece_id']))}</td>"
+                f"<td>{html.escape(str(plc['rod_id']))}</td>"
+                f"<td>{plc['rotation_deg']:g}°</td>"
+                f"<td>{plc['center_x_mm']:g}</td>"
+                f"<td>{plc['cg_x_mm']:g}</td>"
+                f"<td>{html.escape(pts)}</td>"
+                f"<td>{seq_map.get(plc['workpiece_id'], '-')}</td>"
+                f"<td>{html.escape(plc['lift_mode'])}</td>"
+                "</tr>")
+        mom_ok = "通过" if bal.get("moment_ok") else "超容差"
+        total_ok = "通过" if bal.get("total_ok") else "超限"
+        rack_block = (
+            "<h2>吊具布置与载荷平衡</h2>"
+            "<table class='meta'>"
+            f"<tr><td>横梁总载：{bal.get('total_load_kg', 0):g} / "
+            f"{bal.get('beam_limit_kg') if bal.get('beam_limit_kg') is not None else '—'} kg"
+            f"（{total_ok}）</td>"
+            f"<td>偏载力矩：|{bal.get('moment_abs_kg_mm', 0):g}| kg·mm"
+            f"（容差 "
+            f"{bal.get('moment_tolerance_kg_mm') if bal.get('moment_tolerance_kg_mm') is not None else '—'}"
+            f" kg·mm，{mom_ok}）</td></tr>"
+            "</table>"
+            "<table><tr><th>挂杆</th><th>左侧载荷 kg</th><th>右侧载荷 kg</th>"
+            "<th>相对跨中力矩 kg·mm</th><th>分区载荷</th></tr>"
+            f"{''.join(rod_rows)}</table>"
+            "<table><tr><th>工件</th><th>挂杆</th><th>旋转</th><th>中心 x mm</th>"
+            "<th>重心 x mm</th><th>占用/承重吊点（编号:坐标,载荷）</th>"
+            "<th>搬入顺序</th><th>吊挂方式</th></tr>"
+            f"{''.join(plc_rows)}</table>"
+        )
+    else:
+        rack_block = ""
     html_doc = f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <title>随炉卡 · 炉次 {p['batch_id']}</title>
@@ -2821,6 +2929,7 @@ p.small {{ font-size: 12px; margin: 4px 0; }}
     <th>挂位</th><th>交期</th><th>在区/要求 min</th><th>离炉（顺序/时刻/判定）</th><th>标记</th></tr>
 {''.join(rows)}
 </table>
+{rack_block}
 <h2>在炉固化进度与安全出炉预测</h2>
 <table class="meta">
 <tr><td>计算基准时刻：{html.escape(str(basis.get('as_of') or '-'))}（{source_text}）</td>

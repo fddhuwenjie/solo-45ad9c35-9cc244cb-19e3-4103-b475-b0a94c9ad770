@@ -56,6 +56,34 @@ DEFAULT_CLEARANCE_MM = 0.0
 DEFAULT_LUG_TOLERANCE_MM = 50.0
 
 
+def _snapshot(layout):
+    """光束搜索状态：已提交布置 + 各点/分区载荷 + 总载（浅拷贝 placement）。"""
+    return {
+        "placements": [dict(p) for p in layout.placements],
+        "point_load": dict(layout.point_load),
+        "zone_load": dict(layout.zone_load),
+        "total": layout.total,
+    }
+
+
+def _restore(rack, snap):
+    """由快照恢复一个临时 _Layout（placement.run 引用同一挂杆点对象）。"""
+    lay = _Layout(rack)
+    lay.placements = [dict(p) for p in snap["placements"]]
+    lay.point_load = dict(snap["point_load"])
+    lay.zone_load = dict(snap["zone_load"])
+    lay.total = snap["total"]
+    for p in lay.placements:
+        lay._by_rod.setdefault(p["rod_id"], []).append(p)
+    return lay
+
+
+def _sig(snap):
+    """光束去重签名：各挂点载荷向量（同一布局不因搜索路径重复扩展）。"""
+    return tuple(sorted((rid, idx, round(load, 6))
+                        for (rid, idx), load in snap["point_load"].items()))
+
+
 # ---------------------------------------------------------------- 炉架模型
 
 class Rack:
@@ -181,8 +209,27 @@ def build_rack(oven):
                              or oven["hanger_max_load_kg"])
         pts = []
         seen_index = set()
+        multiple_rods = len(hr.get("rods", [])) > 1
+        # 吊点可定义在顶层 hr.points（带 rod_id）或挂杆内 rr.points
+        rod_local_points = rr.get("points") or []
+        sources = []
+        for pp in rod_local_points:
+            sources.append((pp, True))
         for pp in defn_points:
-            if str(pp.get("rod_id")) != rid:
+            sources.append((pp, False))
+        for pp, is_local in sources:
+            prid = pp.get("rod_id")
+            if is_local:
+                # 挂杆内定义的吊点直接归属该挂杆（rod_id 可省）
+                belongs = prid is None or str(prid) == rid
+            elif prid is None:
+                # 顶层 points 未带 rod_id 时，只允许在单挂杆模型下归属
+                if multiple_rods:
+                    raise ValueError("多挂杆模型的 points 必须显式给出 rod_id")
+                belongs = True
+            else:
+                belongs = str(prid) == rid
+            if not belongs:
                 continue
             idx = int(pp["index"])
             if idx in seen_index:
@@ -192,9 +239,10 @@ def build_rack(oven):
                         "max_load_kg": float(pp.get("max_load_kg", default_load)),
                         "blocked": False})
         if not pts:
-            # 未显式给坐标：按间距从 0 等距生成
+            # 未显式给坐标：按间距以挂杆中心（x=0，横梁回转中心）对称生成
             n = int(rr.get("point_count") or oven["hanger_slots"])
-            pts = [{"index": i + 1, "x_mm": i * spacing,
+            x0 = -(n - 1) * spacing / 2.0
+            pts = [{"index": i + 1, "x_mm": x0 + i * spacing,
                     "max_load_kg": default_load, "blocked": False}
                    for i in range(n)]
         pts.sort(key=lambda p: p["index"])
@@ -236,18 +284,19 @@ def piece_extents(center, run, rod):
     return min(xs) - half, max(xs) + half
 
 
-def _collides(existing, lo, hi, across_half, rod):
-    """与同杆已布置工件的净距检查（含工件要求净距）。
+def _collides(existing, lo, hi, new_clearance, rod):
+    """与同杆已布置工件的净距检查（同时考虑双方要求的 clearance_mm）。
 
-    existing: [{"lo","hi","across_half","clearance"}]（同杆）。
-    跨杆方向：按相对挂杆中心的横向半宽重叠才算占位冲突（多杆时）。
+    各自占位区间向外扩 clearance/2：两件净距不足当且仅当扩后的区间相交
+    （恰好相切允许）。existing 元素带 lo/hi/clearance/rod_id。
     """
+    gap = (new_clearance or 0.0) / 2.0
     for e in existing:
         if e["rod_id"] != rod["id"]:
             continue
-        gap_need = (e["clearance"] or 0.0) / 2.0
-        # 沿杆净距
-        if lo < e["hi"] + gap_need and hi > e["lo"] - gap_need:
+        total_gap = gap + (e.get("clearance") or 0.0) / 2.0
+        # 沿杆净距：新件 [lo,hi] 与已布件 [e.lo,e.hi] 外扩后不得重叠
+        if lo < e["hi"] + total_gap and hi > e["lo"] - total_gap:
             return True
     return False
 
@@ -528,15 +577,125 @@ class _Layout:
                           if wp.get("clearance_mm") is not None
                           else self.rack.default_clearance_mm)
         existing = self._by_rod.get(rod_id, [])
-        last = None
+        # 收集各旋转方向的首个失败，返回检查顺序中最靠前的约束
+        failures = []
         for ori in self.rack.orientations(wp):
             res = self._check_run(rod, ori, run, wp, existing, blocked,
                                   clearance, manual=True)
             if "wp" in res:
                 return res
-            last = res
-        return last or {"conflict": F_ROD_SPAN, "rod_id": rod_id,
-                        "point_index": None, "detail": "无可行旋转方向"}
+            failures.append(res)
+        if failures:
+            order = [F_CHAMBER, F_ROD_SPAN, F_POINT_BLOCKED, F_POINT_TAKEN,
+                     F_LUG_MATCH, F_CG_SUPPORT, F_POINT_LOAD, F_ZONE_LOAD,
+                     F_BEAM_TOTAL, F_MOMENT]
+            rank = {c: i for i, c in enumerate(order)}
+            failures.sort(key=lambda r: rank.get(r["conflict"], len(order)))
+            return failures[0]
+        return {"conflict": F_ROD_SPAN, "rod_id": rod_id,
+                "point_index": None, "detail": "无可行旋转方向"}
+
+    # ------------------------------------------------------------ 整组平衡
+    def balance_ok(self, moment=None, total=None):
+        """整组方案是否满足左右偏载容差（绝对力矩 kg·mm 与相对偏心 mm）。"""
+        bal = self.balance()
+        moment = bal["moment_abs_kg_mm"] if moment is None else moment
+        total = bal["total_load_kg"] if total is None else total
+        if self.rack.moment_tolerance_kg_mm is not None \
+                and moment > self.rack.moment_tolerance_kg_mm + 1e-9:
+            return False
+        if self.rack.moment_tolerance_ratio is not None and total > 0:
+            if (moment / total) > self.rack.moment_tolerance_ratio + 1e-9:
+                return False
+        return True
+
+    def _all_placements(self, wp, blocked):
+        """枚举单件在当前布局下所有通过局部检查的候选（力矩不在此拒绝）。"""
+        out = []
+        seen = set()
+        blocked = blocked or set()
+        clearance = float(wp.get("clearance_mm")
+                          if wp.get("clearance_mm") is not None
+                          else self.rack.default_clearance_mm)
+        for rod in self.rack.rods:
+            existing = self._by_rod.get(rod["id"], [])
+            for ori in self.rack.orientations(wp):
+                for run in _candidate_runs(self.rack, rod, wp, ori):
+                    res = self._check_run(rod, ori, run, wp, existing, blocked,
+                                          clearance)
+                    if "wp" not in res:
+                        continue
+                    key = (res["rod_id"],
+                           tuple(sorted(p["index"] for p in res["run"])),
+                           round(res["center_x"], 3), res["rotation_deg"])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append(res)
+        return out
+
+    def balanced_layout(self, workpieces, blocked=None, beam_width=6):
+        """对一组工件搜索满足整组力矩容差的可复现布置。
+
+        光束搜索（beam search）：按给定工件顺序逐件枚举全部可行挂位，
+        保留加入后偏载力矩最小的 beam_width 个中间方案；最终返回第一个
+        满足容差的方案。容差未设置时退化为原 first-fit（候选排序首位），
+        结果与旧确定性布置一致。返回 (placements, None) 或
+        (None, 首个使光束为空的工件号)。
+        """
+        blocked = blocked or set()
+        if not workpieces:
+            return [], None
+        tolerance_set = (self.rack.moment_tolerance_kg_mm is not None
+                         or self.rack.moment_tolerance_ratio is not None)
+        # 状态 = (snapshot dict, placements)；空状态为起点
+        states = [(_snapshot(self), [])]
+        for wp in workpieces:
+            if not tolerance_set:
+                # 未设偏载容差：完全沿用旧确定性 first-fit（最低可行吊点段），
+                # 不做任何平衡改位
+                snap, chosen = states[0]
+                scratch = _restore(self.rack, snap)
+                candidates = scratch._all_placements(wp, blocked)
+                if not candidates:
+                    return None, wp["id"]
+                trial = _restore(self.rack, snap)
+                trial.commit(candidates[0])
+                states = [(_snapshot(trial), chosen + [candidates[0]])]
+                continue
+            candidates = []
+            for snap, chosen in states:
+                scratch = _restore(self.rack, snap)
+                for plc in scratch._all_placements(wp, blocked):
+                    trial = _restore(self.rack, snap)
+                    trial.commit(plc)
+                    bal = trial.balance()
+                    candidates.append((
+                        # 排序键：偏载力矩（绝对值）→ 挂杆/中心/工件号确定性
+                        round(bal["moment_abs_kg_mm"], 3),
+                        plc["rod_id"], plc["center_x"], wp["id"],
+                        _snapshot(trial), chosen + [plc]))
+            if not candidates:
+                return None, wp["id"]
+            candidates.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
+            dedup = []
+            seen = set()
+            for cand in candidates:
+                sig = _sig(cand[4])
+                if sig in seen:
+                    continue
+                seen.add(sig)
+                dedup.append((cand[4], cand[5]))
+                if len(dedup) >= beam_width:
+                    break
+            states = dedup
+        # 全部工件放入后选第一个满足整组容差的状态
+        for snap, chosen in states:
+            trial = _restore(self.rack, snap)
+            if trial.balance_ok():
+                return chosen, None
+        # 都不满足：返回最优方案的工件集合外标志（调用方按组分拆）
+        return None, workpieces[-1]["id"]
 
     def _check_run(self, rod, ori, run, wp, existing, blocked, clearance,
                    manual=False):
@@ -573,8 +732,9 @@ class _Layout:
             return fail(F_ROD_SPAN, run[0]["index"],
                         f"指定 {len(run)} 个吊点跨度 {provided:.0f}mm"
                         f" 不足以容纳工件沿杆投影 {ori['along_mm']:.0f}mm")
-        # 3. 共享吊点 / 净距（先按段外廓粗查；LUG 对齐后按真实外廓复查）
-        if _collides(existing, lo, hi, ori["across_mm"] / 2.0, rod):
+        # 3. 共享吊点 / 净距（先按段外廓粗查；LUG 对齐后按真实外廓复查；
+        #    净距同时计入双方 clearance_mm）
+        if _collides(existing, lo, hi, clearance, rod):
             return fail(F_POINT_TAKEN, run[0]["index"],
                         "与已布置工件净距不足/共享吊点")
         # 4. 吊耳对齐（决定工件中心的平移位置）
@@ -592,7 +752,7 @@ class _Layout:
             if llo < span_lo - 1e-9 or lhi > span_hi + 1e-9:
                 return fail(F_ROD_SPAN, run[0]["index"],
                             "吊耳对齐后工件外廓超出挂杆跨度")
-            if _collides(existing, llo, lhi, ori["across_mm"] / 2.0, rod):
+            if _collides(existing, llo, lhi, clearance, rod):
                 return fail(F_POINT_TAKEN, run[0]["index"],
                             "与已布置工件净距不足/共享吊点")
             lo, hi, center_x = llo, lhi, piece_center
@@ -642,16 +802,9 @@ class _Layout:
             return fail(F_BEAM_TOTAL, None,
                         f"横梁总载 {new_total:.1f}/"
                         f"{self.rack.beam_max_load_kg:g} kg 超限")
-        # 9. 左右力矩平衡
-        trial = self._trial_moment(rod, run, loads, center_x, wp)
-        bad_mom = (self.rack.moment_tolerance_kg_mm is not None
-                   and abs(trial) > self.rack.moment_tolerance_kg_mm + 1e-9)
-        if self.rack.moment_tolerance_ratio is not None and new_total > 0:
-            bad_mom = bad_mom or (
-                abs(trial) / new_total > self.rack.moment_tolerance_ratio + 1e-9)
-        if bad_mom:
-            return fail(F_MOMENT, None,
-                        f"布置后偏载力矩 {abs(trial):.0f} kg·mm 超容差")
+        # 左右力矩平衡不在单件放入时拒绝（单个 10 kg 件必然偏载，但整组
+        # 可能平衡，如后续在对侧挂对称件）；平衡按整组方案在 balanced_layout
+        # 中搜索候选，并在组批完成后由 _group_balanced 统一判定。
         return {"wp": wp, "rod_id": rod["id"], "rod": rod,
                 "rotation_deg": ori["rotation_deg"],
                 "run": run, "lo": lo, "hi": hi, "center_x": center_x,

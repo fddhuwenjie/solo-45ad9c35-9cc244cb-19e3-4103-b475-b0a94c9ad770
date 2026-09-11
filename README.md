@@ -12,6 +12,18 @@
 单个探头松脱、卡值或漂移不会直接决定整件返工——可在出炉前停用故障探头，
 系统只重算该工件并记录结果变化。
 
+吊具布置与载荷平衡：大门板全挂炉架一侧时，即使每个吊点都不超载，横梁仍会
+偏载。试算可携带**挂杆/吊点坐标模型**（`hanger_rack`：多挂杆、吊点 x 坐标、
+单点限载、横梁分区载荷、横梁总载、左右偏载力矩容差），工件可带**重心偏移、
+可旋转方向、吊耳坐标、要求净距**；引擎把工件映射到**具体吊点坐标**，检查
+净距、共享吊点、单点承重、分区承重、横梁总载与左右力矩，并返回**可复现的
+挂位组合与搬入顺序**。偏载按**整组方案**判定（单件偏载不直接拒绝，对侧补挂
+对称件后力矩归零仍可同炉）；现场临时封掉挂位用 `hanger_blackouts`（只在与
+炉次占用时段重叠时封点），人工调整可用校验端点复核；**签发后布置冻结**，
+吊点故障登记（`/schedule/point-fault`）只重排未签发炉次，并给出迁移工件与
+交期变化。
+
+
 校准证书版本化：探头可录入**不可覆盖的多点校准版本**（证书号、校准/到期时刻、
 示值—参考值点列），绑定探头时指定版本；签发按计划入炉时刻检查证书有效期与
 粉料温区覆盖；测温按签发时冻结的点列**线性插值**，区间外读数不计入保温累计；
@@ -30,6 +42,7 @@ bash samples/scenario_c_probes.sh             # 多探头测温/停用故障探�
 bash samples/scenario_d_piece_unload.sh       # 轻薄/厚重混炉逐件出炉、强制出炉
 bash samples/scenario_e_blackout.sh           # 停机窗避让/冲突/逐炉时间线
 bash samples/scenario_f_calibrations.sh       # 探头校准证书版本化/签发检查/插值
+bash samples/scenario_g_racking.sh            # 吊具布置/载荷平衡/人工校验/吊点故障
 
 # 回归测试（不依赖服务进程）
 python3 -m unittest discover -s tests -v
@@ -95,6 +108,60 @@ samples/
   `UNKNOWN_POWDER`（粉料批号未登记；该订单不入库，登记粉料后重新提交即可排产。
   复用已有 workpiece_id 提交未登记粉料时，该工件本次不参与编排，
   不会按库内残留的旧粉料进入新炉次）。
+
+### 吊具布置与载荷平衡
+- 炉架模型 `ovens[].hanger_rack`（缺省退化为旧连续编号：单挂杆、等距吊点、
+  不查分区/总载/力矩）：
+  - `rods[]` 挂杆：`id`、`axis`（L 沿炉长 / W 沿炉宽）、`y_mm/z_mm` 位置、
+    `point_count`+`point_spacing_mm`（以挂杆中心 x=0 对称生成）或显式
+    `points:[{index,x_mm,max_load_kg}]`（也可在顶层 `hanger_rack.points`
+    用 `rod_id` 区分）、`zones:[{id,x_min_mm,x_max_mm,max_load_kg}]` 横梁分区；
+  - `beam_max_load_kg` 横梁总载；`moment_tolerance_kg_mm` 左右偏载力矩容差
+    （相对跨中 Σ载荷×力臂 的绝对值）与/或 `moment_tolerance_ratio`
+    （力矩/总载，等效平均偏心 mm）；`default_clearance_mm` 默认净距、
+    `lug_tolerance_mm` 吊耳对齐容差；
+- 工件（`orders[]`）可选：`cg_offset_x_mm/cg_offset_y_mm` 重心相对几何中心
+  偏移、`allowed_rotations_deg` 可旋转方向（默认 [0,90]）、
+  `lift_points_mm` 吊耳沿长轴坐标（相对工件中心；给出即按吊耳对吊点，
+  非吊耳对齐吊点只占位不承重）、`clearance_mm` 与相邻工件的要求净距；
+- 载荷分配：均布承重时工件投影覆盖的相邻吊点按重心力臂静力学分配；吊耳
+  承重时按吊耳对齐吊点（两个吊耳用杠杆法）。布置检查顺序（首个冲突约束
+  代码，随拒绝明细返回）：`CHAMBER_FIT` 炉膛尺寸 → `ROD_SPAN` 挂杆跨度 →
+  `POINT_BLOCKED` 禁用吊点 → `POINT_TAKEN` 净距/共享吊点 → `LUG_MATCH`
+  吊耳对不上 → `CG_SUPPORT` 重心在支撑跨外 → `POINT_LOAD` 单点超载 →
+  `ZONE_LOAD` 分区超载 → `BEAM_TOTAL` 横梁总载 → `MOMENT` 整组偏载；
+- **偏载按整组方案判定**：引擎对炉内工件做光束搜索（beam search），在满足
+  单点/分区/总载的候选挂位中选整组 |力矩| 最小的可复现方案；单个工件偏心
+  不拒绝，只要整组（如对侧补挂对称件）满足容差即可。未设力矩容差的炉架
+  保持 first-fit 旧确定性布置，不改位；
+- 净距检查**同时计入相邻双方**的 `clearance_mm`（各取一半之和，相切允许）；
+- 临时封位 `hanger_blackouts`：`{oven_id,rod_id,point_index,start_at,end_at}`，
+  **只封与炉次占用区间（计划入炉→出炉+周转）重叠的吊点**；已结束的窗不影响
+  后续开排炉次，未知炉号/挂杆/吊点或起止倒序一律 400；
+- 炉次返回 `rack_layout`：每件 `placement`（挂杆/旋转/中心与重心坐标/
+  占用与承重吊点载荷/吊挂方式）、`load_balance`（左右载荷、各分区、
+  总载、力矩与是否合格）、`load_in_sequence` 搬入顺序（由内向外、同杆
+  从左到右、再按工件号）；
+- 放不下的工件进入 `unscheduled`：原因新增 `POINT_BLACKOUT`（禁用吊点）
+  与 `LOAD_BALANCE`（整组平衡不满足），并给 `first_conflict`（首个冲突
+  约束代码/炉号/挂杆/吊点/说明）、`per_oven` 逐炉明细与 `alternative_ovens`
+  硬可行炉（尺寸/承重放得下，只是当前时段/平衡不满足）；拒绝明细随版本快照
+  存入 `schedule_rejections`，版本详情 `GET /versions/<id>` 的 `rejections`
+  可查；
+- **人工调整**：`POST /batches/<id>/arrangement/verify`，body
+  `{"assignments":[{workpiece_id,rod_id,point_indices,rotation_deg?}],
+  "apply":false}`。逐条复核净距/共享吊点/单点/分区/总载/重心/吊耳/禁用吊点，
+  并按整组复核总载与力矩；不通过返回 409 与 `violations`（不落库），
+  `apply=true` 时仅 DRAFT 炉次可采用（已签发布置冻结，只能 check_only）；
+- **吊点故障**：`POST /schedule/point-fault`
+  `{oven_id,rod_id,point_index,reason,started_at?}` 登记跨版本持续故障，
+  自动基于最新版本参数重排**未签发（DRAFT）炉次**：已签发/在炉炉次原样
+  保留，占用故障吊点时列入 `frozen_conflicts`；草稿重排后返回 `migrations`
+  （每件的炉号/挂杆/挂位/出炉时刻变化与逾期）。重复登记同一未修复故障
+  返回 409；`POST /schedule/point-fault/<id>/resolve` 修复后吊点恢复可用，
+  `GET /schedule/point-faults?active=1` 查询；
+- 炉次详情、版本快照、JSON 档案与随炉卡均记录挂杆/吊点坐标、各点载荷、
+  分区/总载、力矩与搬入顺序；签发时整套布置随炉次冻结（`arrangement_json`）。
 
 ### 多探头测温
 - 每件工件可登记一个或多个探头及**校准偏移**（`POST /workpieces/<id>/probes`），
@@ -248,7 +315,11 @@ samples/
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/schedule/trial` | 试算：排出炉次/挂位/升温/保温/出炉时刻（避让停机窗），形成关联版本；响应含逐炉时间线与停机冲突清单 |
+| POST | `/schedule/trial` | 试算：排出炉次/挂位/升温/保温/出炉时刻（避让停机窗），形成关联版本；响应含逐炉时间线、停机冲突清单、吊具布置（坐标/载荷/力矩/搬入顺序）、拒绝明细与整组平衡 |
+| POST | `/batches/<id>/arrangement/verify` | **人工吊具布置复核**：assignments（工件→挂杆/吊点）逐条+整组校验；`apply=true` 时采用（仅 DRAFT），不通过 409 列违反约束 |
+| POST | `/schedule/point-fault` | **登记吊点故障并重排**：只重排未签发炉次，已签发占用列入 frozen_conflicts；返回迁移工件/挂位/时刻与交期变化 |
+| POST | `/schedule/point-fault/<id>/resolve` | 修复吊点故障（之后试算恢复使用该吊点，历史保留） |
+| GET  | `/schedule/point-faults` | 吊点故障清单（`?active=0` 含已修复） |
 | POST | `/batches/<id>/issue` | 签发（DRAFT→ISSUED，冻结工件/粉料/探头/校准证书快照；证书缺失/未生效/过期/温区覆盖不足时 409 阻止） |
 | POST | `/batches/<id>/load` | 入炉（ISSUED→IN_OVEN），body 可带 `at` |
 | POST | `/batches/<id>/readings` | 测温回传（仅 IN_OVEN 且工件仍在炉），`readings:[{workpiece_id,probe_id,ts,metal_temp_c}]`，接受后即时重算进度 |
@@ -289,16 +360,30 @@ samples/
   "start_at": "2026-09-10T08:00:00",
   "ovens":   [{"id","chamber_l_mm","chamber_w_mm","chamber_h_mm",
                "heat_rate_c_per_min","mass_factor_min_per_kg","ambient_c",
-               "turnaround_minutes","hanger_slots","hanger_spacing_mm","hanger_max_load_kg"}],
+               "turnaround_minutes","hanger_slots","hanger_spacing_mm","hanger_max_load_kg",
+               "hanger_rack?":{"rods":[{"id","axis?","y_mm?","z_mm?",
+                 "point_count?","point_spacing_mm?","default_point_load_kg?",
+                 "points?":[{"index","x_mm","max_load_kg?"}],
+                 "zones?":[{"id","x_min_mm","x_max_mm","max_load_kg"}]}],
+                 "points?":[{"rod_id","index","x_mm","max_load_kg?"}],
+                 "beam_max_load_kg?","moment_tolerance_kg_mm?",
+                 "moment_tolerance_ratio?","default_clearance_mm?",
+                 "lug_tolerance_mm?"}}],
   "powders": [{"batch_no","temp_min_c","temp_max_c","hold_minutes"}],
   "forbidden_pairs": [["GRP_A","GRP_B"]],
   "blackout_windows": [{"oven_id","kind","start_at","end_at","note"}],
+  "hanger_blackouts": [{"oven_id","rod_id","point_index","start_at","end_at?","note?"}],
   "orders":  [{"workpiece_id","order_id","length_mm","width_mm","height_mm",
-               "weight_kg","powder_batch","compat_group","due_at"}]
+               "weight_kg","powder_batch","compat_group","due_at",
+               "cg_offset_x_mm?","cg_offset_y_mm?","allowed_rotations_deg?",
+               "lift_points_mm?","clearance_mm?"}]
 }
 ```
 
 `blackout_windows` 可省略；`kind` 取 `CLEANING`（清炉）/ `CALIBRATION`（校准）/
-`MAINTENANCE`（检修），也接受中文 清炉/校准/检修。
+`MAINTENANCE`（检修），也接受中文 清炉/校准/检修。`hanger_blackouts` 为吊点
+禁用时段（临时封位），`end_at` 可省略表示开放结束；禁用只在与炉次占用时段
+重叠时生效。未给 `hanger_rack` 时退化为旧连续编号模型（单挂杆、等距吊点、
+不查分区/总载/力矩）。
 
 时间为本地 ISO 格式（可带时区，将转为本地时间存储）。
