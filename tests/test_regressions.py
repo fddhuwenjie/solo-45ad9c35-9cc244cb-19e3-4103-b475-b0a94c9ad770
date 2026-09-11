@@ -40,7 +40,7 @@ class RegressionTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.app = create_app({"DATABASE": os.path.join(self.tmp.name, "t.sqlite"),
-                               "TESTING": True})
+                               "TESTING": True, "REQUIRE_PACK_LIMIT_AT_ISSUE": False})
         self.c = self.app.test_client()
 
     def tearDown(self):

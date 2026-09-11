@@ -41,7 +41,7 @@ class ProgressTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.app = create_app({"DATABASE": os.path.join(self.tmp.name, "t.sqlite"),
-                               "TESTING": True})
+                               "TESTING": True, "REQUIRE_PACK_LIMIT_AT_ISSUE": False})
         self.c = self.app.test_client()
 
     def tearDown(self):
@@ -187,7 +187,7 @@ class ProgressTest(unittest.TestCase):
     def test_insufficient_probes_blocker_and_disable_recalc(self):
         # MIN_VALID_PROBES=2 需要在 create_app 时配置：单独建一个 app
         app2 = create_app({"DATABASE": os.path.join(self.tmp.name, "t2.sqlite"),
-                           "TESTING": True, "MIN_VALID_PROBES": 2})
+                           "TESTING": True, "MIN_VALID_PROBES": 2, "REQUIRE_PACK_LIMIT_AT_ISSUE": False})
         c = app2.test_client()
         r = c.post("/api/schedule/trial", json={
             "reason": "p", "start_at": LOAD_AT, "ovens": [OVEN],

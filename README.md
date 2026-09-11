@@ -309,19 +309,23 @@ samples/
 观察中，**暂不计为完成 DONE**），按带时标的**表面温度**形成连续低温区间：
 - 粉料资料新增两个包装门限（试算 `powders[]`，两者须同时给出、非负）：
   `pack_temp_limit_c` 包装温度上限、`low_temp_hold_minutes` 低温保持时长；
-  **签发时冻结到工件**（`batch_items.snap_*`），改主数据不影响已签发炉次；
-  未登记门限的粉料：查询/放行以 `PACK_LIMIT_MISSING` 阻塞（紧急搬运除外）。
+  **签发时必须两字段齐全（默认强制，缺失 409 阻止签发，列 `pack_threshold_problems`）
+  并冻结到工件**（`batch_items.snap_*`），签发后只读取冻结快照，**不回退
+  后来修改的粉料主数据**——空快照炉次的冷却查询与 NORMAL 放行永远给出
+  `PACK_LIMIT_MISSING`（应用配置 `REQUIRE_PACK_LIMIT_AT_ISSUE=false` 可放宽签发，
+  但空快照仍不可放行；仅紧急搬运可用）；
 - 离炉动作：安全合格件置 **COOLING**（不再直接 DONE），强制/不合格件仍为
   REWORK_PENDING；炉次仍按「最后一件离炉」转 UNLOADED。
 - **冷却测温写入** `POST /batches/<id>/workpieces/<wid>/cooling-readings`，
   body `{"readings":[{ts, surface_temp_c}]}`（仅 COOLING 件接收，早于离炉
-  时刻拒收）；按 **(炉次, 工件, 时刻)** 幂等去重，同点同温度重复回传计入
-  `duplicates` 不截断区间；以下情形**截断当前连续低温区间**（此前保持作废）：
+  时刻拒收）；以下情形**截断当前连续低温区间**（此前保持作废）：
   - **乱序** `OUT_OF_ORDER`：ts 早于已收录最新时标（读数照常入库标记，
     若本身不超温则锚定新区间）；
-  - **同点重复** `TS_CONFLICT`：同一时刻又报来**不同温度**（读数照常入库
-    标记，该时刻温度不可信，截断区间且不锚新区间）；完全一致的同点同温度
-    回传按幂等重复忽略，不截断；
+  - **同点重复**：同一时刻再次上报，无论温度是否相同都**保存本次提交**、
+    记录区间中断并从该点**之后**重新累计（不做幂等忽略）——温度不同为
+    `TS_CONFLICT`（不锚新区间），温度完全相同为 `TS_DUPLICATE`，响应中
+    后者计入 `duplicates`、二者都计入 `conflicts`；进度/放行/批次查询/
+    归档**不得拼接中断前后**的时间；
   - **采样间隔过长** `LONG_GAP`：相邻读数间隔超过缺报阈值
     （配置 `COOLING_GAP_MINUTES`，默认 10 分钟）；
   - **再次升温** `REHEAT`：读数高于包装温度上限，下一条低温读数另起新区间。
@@ -373,7 +377,7 @@ samples/
 | GET  | `/batches/<id>/progress` | 在炉固化进度与安全出炉预测（可带 `?as_of=` 计算基准，逐件状态/阻塞/告警，炉次级最晚安全出炉与计划过早分钟）；**汇总仅计算仍在炉工件** |
 | POST | `/batches/<id>/workpieces/<wid>/unload` | **逐件出炉**：按 `at` 判定单件；不达标普通请求 409（给累计/剩余/阻塞原因），`force=true`+`reason` 强制出炉（不合格+审计） |
 | POST | `/batches/<id>/unload` | 整炉出炉判定：逐件复用同一判定，**已离炉工件跳过**；最后一件离炉后炉次 UNLOADED；合格件进入 COOLING（暂不完成） |
-| POST | `/batches/<id>/workpieces/<wid>/cooling-readings` | **冷却测温写入**：仅 COOLING 件，`readings:[{ts,surface_temp_c}]`；同点幂等去重，乱序/同时刻冲突/长间隔/再次升温截断连续低温区间 |
+| POST | `/batches/<id>/workpieces/<wid>/cooling-readings` | **冷却测温写入**：仅 COOLING 件，`readings:[{ts,surface_temp_c}]`；乱序/同点重复（含同温度 TS_DUPLICATE）/长间隔/再次升温均保存并截断连续低温区间，从该点后重新累计 |
 | GET  | `/batches/<id>/workpieces/<wid>/cooling` | **单工件冷却进度**：当前读数、当前区间有效保持分钟、最早放行时刻、未满足项、区间中断追溯（可带 `?as_of=`） |
 | GET  | `/batches/<id>/cooling` | **炉次冷却汇总**：逐件冷却状态与冷却中/已放行/紧急搬运计数 |
 | POST | `/batches/<id>/workpieces/<wid>/release` | **冷却搬运放行**：门限满足正常放行（→DONE）；未达门限 409；`emergency=true`+`reason` 紧急搬运送返工（→REWORK_PENDING） |
@@ -403,6 +407,7 @@ samples/
 | `STUCK_PROBE_MIN_CONSECUTIVE` | 5 | 同一探头连续相同读数达到该点数记为卡值 |
 | `MIN_VALID_PROBES` | 1 | 判定合格所需的最少有效探头数 |
 | `COOLING_GAP_MINUTES` | 10 | 冷却测温采样间隔超过该分钟数截断低温区间；最新读数距基准时刻超过该值视为陈旧不得放行 |
+| `REQUIRE_PACK_LIMIT_AT_ISSUE` | true | 签发时粉料必须登记包装温度上限/低温保持时长；关闭后允许签发空快照炉次（冷却 NORMAL 放行仍永久以 PACK_LIMIT_MISSING 阻塞） |
 
 ### 试算请求体要点
 

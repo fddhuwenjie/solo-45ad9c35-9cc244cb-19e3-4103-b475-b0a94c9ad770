@@ -67,7 +67,7 @@ class MultiProbeTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.app = create_app({"DATABASE": os.path.join(self.tmp.name, "t.sqlite"),
-                               "TESTING": True})
+                               "TESTING": True, "REQUIRE_PACK_LIMIT_AT_ISSUE": False})
         self.c = self.app.test_client()
 
     def tearDown(self):
@@ -308,7 +308,7 @@ class MultiProbeTest(unittest.TestCase):
     def test_single_probe_dropout_gap_and_validity(self):
         """T2 仅 08:00 上报一次后掉线：生成 PROBE_GAP，且不再计为有效探头。"""
         app = create_app({"DATABASE": os.path.join(self.tmp.name, "t4.sqlite"),
-                          "TESTING": True, "MIN_VALID_PROBES": 2})
+                          "TESTING": True, "MIN_VALID_PROBES": 2, "REQUIRE_PACK_LIMIT_AT_ISSUE": False})
         c = app.test_client()
         r = c.post("/api/schedule/trial", json={
             "reason": "t", "start_at": LOAD_AT, "ovens": [OVEN],
@@ -446,7 +446,7 @@ class MultiProbeTest(unittest.TestCase):
     # ---------------------------------------------------------- 6. 有效探头数
     def test_insufficient_probes_not_ok(self):
         app = create_app({"DATABASE": os.path.join(self.tmp.name, "t2.sqlite"),
-                          "TESTING": True, "MIN_VALID_PROBES": 2})
+                          "TESTING": True, "MIN_VALID_PROBES": 2, "REQUIRE_PACK_LIMIT_AT_ISSUE": False})
         c = app.test_client()
         r = c.post("/api/schedule/trial", json={
             "reason": "t", "start_at": LOAD_AT, "ovens": [OVEN],
@@ -476,7 +476,7 @@ class MultiProbeTest(unittest.TestCase):
 
     def test_min_probes_satisfied_ok(self):
         app = create_app({"DATABASE": os.path.join(self.tmp.name, "t3.sqlite"),
-                          "TESTING": True, "MIN_VALID_PROBES": 2})
+                          "TESTING": True, "MIN_VALID_PROBES": 2, "REQUIRE_PACK_LIMIT_AT_ISSUE": False})
         c = app.test_client()
         r = c.post("/api/schedule/trial", json={
             "reason": "t", "start_at": LOAD_AT, "ovens": [OVEN],

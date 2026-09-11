@@ -15,6 +15,7 @@ def create_app(test_config=None):
         MIN_VALID_PROBES=1,            # 判定合格所需的最少有效探头数
         COOLING_GAP_MINUTES=10,        # 冷却测温采样间隔超过该分钟数即截断低温区间，
                                        # 最新读数距基准时刻超过该值视为陈旧不得放行
+        REQUIRE_PACK_LIMIT_AT_ISSUE=True,  # 签发时粉料必须有包装温度上限/低温保持时长
     )
     if test_config:
         app.config.update(test_config)

@@ -153,19 +153,49 @@ class CoolingTest(unittest.TestCase):
         self.assertEqual(body["accepted"], 0)
         self.assertIn("早于实际离炉时刻", body["rejected"][0]["reason"])
 
-    def test_idempotent_same_point_duplicate(self):
+    def test_same_point_duplicate_saved_and_truncates(self):
+        """时刻+温度完全相同的重复提交：保存本次提交、记录中断、从该点后重算。"""
         bid = self._setup()
         self._cure_and_unload(bid, "W-1")
-        r1, out = self._cool_readings(bid, "W-1", [45.0, 44.0])
-        self.assertEqual(r1.get_json()["accepted"], 2)
-        # 同点同温度重复回传：幂等去重，计入 duplicates，不截断区间
+        r1, out = self._cool_readings(bid, "W-1", [45.0, 44.0, 45.0, 44.0])
+        # 09:00-09:15 连续 4 点，累计 15 分钟
+        self.assertEqual(r1.get_json()["accepted"], 4)
+        ev = r1.get_json()["cooling"]
+        self.assertEqual(ev["held_low_temp_minutes"], 15.0)
+        # 重复提交 09:00、09:05（时刻+温度完全相同）：不幂等忽略，
+        # 保存两条 TS_DUPLICATE 并截断区间
         r2 = self.c.post(
             f"/api/batches/{bid}/workpieces/W-1/cooling-readings",
-            json={"readings": out, "at": _ts(30)})
+            json={"readings": out[:2], "at": _ts(30)})
         b2 = r2.get_json()
         self.assertEqual(b2["accepted"], 0)
         self.assertEqual(b2["duplicates"], 2)
-        self.assertEqual(b2["conflicts"], 0)
+        self.assertEqual(b2["conflicts"], 2)
+        ev = b2["cooling"]
+        self.assertIn("TS_DUPLICATE",
+                      [i["code"] for i in ev["interruptions"]])
+        # 不能拼接中断前后：09:10/09:15 是重复提交之前已采信的读数，不能拿来
+        # 与重复点之后拼接——当前区间作废，须从重复点之后新到的读数重新累计
+        self.assertEqual(ev["held_low_temp_minutes"], 0.0)
+        self.assertIsNone(ev["current_segment"])
+        # 完整读数保留：09:00 与 09:05 各两条
+        d = self.c.get(f"/api/batches/{bid}").get_json()
+        rows = d["items"][0]["cooling"]["readings"]
+        dup = [x for x in rows if x["kind"] == "TS_DUPLICATE"]
+        self.assertEqual(len(dup), 2)
+        # 即使此前累计已 15 分钟，重复截断后未重新保持满 20 分钟，NORMAL 409
+        r = self.c.post(f"/api/batches/{bid}/workpieces/W-1/release",
+                        json={"at": _ts(30)})
+        self.assertEqual(r.status_code, 409)
+        codes = {u["code"] for u in r.get_json()["unmet"]}
+        self.assertIn("HOLD_NOT_MET", codes)
+        # 重复点之后新到的读数重新累计（09:20 锚定新段，09:25 累计 5 分钟）
+        r3, _ = self._cool_readings(bid, "W-1", [45.0, 45.0],
+                                    start_min=20, step=5)
+        ev3 = r3.get_json()["cooling"]
+        self.assertEqual(ev3["current_segment"]["start"],
+                         "2026-09-10T09:20:00")
+        self.assertEqual(ev3["held_low_temp_minutes"], 5.0)
 
     # ----------------------------------------------------- 3. 区间截断
     def test_normal_low_streak_hold_and_earliest_release(self):
@@ -268,14 +298,20 @@ class CoolingTest(unittest.TestCase):
                  for x in rows}
         self.assertEqual(kinds["09:05|45"], "OK")
         self.assertEqual(kinds["09:05|70"], "TS_CONFLICT")
-        # 同点同温度仍为幂等重复（不截断、不入库）
+        # 同点同温度同样保存并截断（TS_DUPLICATE，不再幂等忽略）：
+        # 先在冲突之后补两条低温形成新区间，再重复其中一点
+        self._cool_readings(bid, "W-1", [45.0, 45.0], start_min=10)
         r = self.c.post(
             f"/api/batches/{bid}/workpieces/W-1/cooling-readings",
             json={"readings": [
-                {"ts": "2026-09-10T09:00:00", "surface_temp_c": 45}],
-                "at": _ts(10)})
+                {"ts": "2026-09-10T09:10:00", "surface_temp_c": 45}],
+                "at": _ts(20)})
         self.assertEqual(r.get_json()["duplicates"], 1)
-        self.assertEqual(r.get_json()["conflicts"], 0)
+        self.assertEqual(r.get_json()["conflicts"], 1)
+        self.assertIn("TS_DUPLICATE",
+                      [i["code"] for i in r.get_json()["cooling"]["interruptions"]])
+        # 重复点截断：09:10->09:15 的 5 分钟不能跨重复点拼接，保持清零
+        self.assertEqual(r.get_json()["cooling"]["held_low_temp_minutes"], 0.0)
 
     def test_stale_reading_blocks_release(self):
         bid = self._setup()
@@ -349,19 +385,65 @@ class CoolingTest(unittest.TestCase):
         self.assertEqual(self.c.post("/api/workpieces/W-1/rework").status_code,
                          200)
 
-    def test_missing_pack_threshold_blocks_release(self):
-        bid = self._setup(pack_limit=None)
-        self._cure_and_unload(bid, "W-1")
-        self._cool_readings(bid, "W-1", [30.0, 30.0])
-        ev = self._cool(bid, "W-1", at=_ts(5))
-        self.assertIn("PACK_LIMIT_MISSING", {u["code"] for u in ev["unmet"]})
-        r = self.c.post(f"/api/batches/{bid}/workpieces/W-1/release",
-                        json={"at": _ts(5)})
+    def test_issue_rejected_when_pack_threshold_missing(self):
+        """粉料缺包装门限：签发明确拒绝（409），炉次保持 DRAFT。"""
+        payload = {
+            "reason": "x", "start_at": LOAD_AT, "ovens": [OVEN],
+            "powders": [{"batch_no": "PN", "temp_min_c": 160,
+                         "temp_max_c": 180, "hold_minutes": 10}],
+            "forbidden_pairs": [],
+            "orders": [{"workpiece_id": "WN", "order_id": "O",
+                        "length_mm": 500, "width_mm": 400, "height_mm": 300,
+                        "weight_kg": 10, "powder_batch": "PN"}]}
+        r = self.c.post("/api/schedule/trial", json=payload)
+        nbid = r.get_json()["new_batches"][0]["batch_id"]
+        r = self.c.post(f"/api/batches/{nbid}/issue")
         self.assertEqual(r.status_code, 409)
-        # 紧急搬运仍可执行（人工决定）
+        body = r.get_json()
+        self.assertEqual(body["pack_threshold_problems"][0]["code"],
+                         "PACK_LIMIT_MISSING")
+        self.assertEqual(
+            body["pack_threshold_problems"][0]["missing_fields"],
+            ["pack_temp_limit_c", "low_temp_hold_minutes"])
+        self.assertEqual(
+            self.c.get(f"/api/batches/{nbid}").get_json()["state"], "DRAFT")
+
+    def test_empty_snapshot_never_falls_back_to_master_data(self):
+        """签发快照为空（遗留炉次）：即使后来给粉料补门限，也不得放行。"""
+        bid = self._setup(powder="PLEGACY")
+        # 模拟门限缺失的遗留签发：清空冻结快照
+        import sqlite3
+        db_path = self.app.config["DATABASE"]
+        db = sqlite3.connect(db_path)
+        db.execute("UPDATE batch_items SET snap_pack_temp_limit_c=NULL,"
+                   " snap_low_temp_hold_minutes=NULL WHERE batch_id=?", (bid,))
+        db.commit()
+        db.close()
+        self._cure_and_unload(bid, "W-1")
+        self._cool_readings(bid, "W-1", [30.0, 30.0, 30.0, 30.0, 30.0])
+        # 后来补改粉料主数据：已签发炉次不得回退采用
+        r = self.c.post("/api/schedule/trial", json={
+            "reason": "patch powder", "start_at": LOAD_AT, "ovens": [OVEN],
+            "powders": [{"batch_no": "PLEGACY", "temp_min_c": 160,
+                         "temp_max_c": 180, "hold_minutes": 10,
+                         "pack_temp_limit_c": 50,
+                         "low_temp_hold_minutes": 20}],
+            "orders": []})
+        self.assertEqual(r.status_code, 201)
+        ev = self._cool(bid, "W-1", at=_ts(25))
+        self.assertIn("PACK_LIMIT_MISSING",
+                      {u["code"] for u in ev["unmet"]})
+        self.assertIsNone(ev["earliest_release_at"])
+        # 即使表面温度早已够低、保持够久，NORMAL 仍 409
         r = self.c.post(f"/api/batches/{bid}/workpieces/W-1/release",
-                        json={"at": _ts(5), "emergency": True,
-                              "reason": "门限资料缺失，质量主管现场确认"})
+                        json={"at": _ts(25)})
+        self.assertEqual(r.status_code, 409)
+        codes = {u["code"] for u in r.get_json()["unmet"]}
+        self.assertIn("PACK_LIMIT_MISSING", codes)
+        # 紧急搬运（人工决定）仍可用
+        r = self.c.post(f"/api/batches/{bid}/workpieces/W-1/release",
+                        json={"at": _ts(25), "emergency": True,
+                              "reason": "门限快照缺失，质量主管现场确认返工"})
         self.assertEqual(r.status_code, 200)
 
     # ----------------------------------------------------- 5. 结案门限
@@ -499,9 +581,25 @@ class CoolingPureTest(unittest.TestCase):
         kind, _ = cooling_mod.admit(base, ts(3), 45.0)
         self.assertEqual(kind, cooling_mod.KIND_OUT_OF_ORDER)
         kind, _ = cooling_mod.admit(base, ts(5), 44.0)
-        self.assertEqual(kind, cooling_mod.KIND_OK)   # 同点同温度=幂等
+        self.assertEqual(kind, cooling_mod.KIND_TS_DUPLICATE)  # 同点重复（同温度）
         kind, _ = cooling_mod.admit(base, ts(5), 80.0)
         self.assertEqual(kind, cooling_mod.KIND_TS_CONFLICT)
+
+    def test_duplicate_breaks_segment_in_engine(self):
+        from datetime import datetime
+        ts = lambda m: datetime.fromisoformat(f"2026-09-10T09:{m:02d}:00")
+        # 已累计 15 分钟后，重复提交 09:00 同温读数：区间截断、不拼前后
+        pts = self._pts((0, 45, "OK"), (5, 45, "OK"), (10, 45, "OK"),
+                        (15, 45, "OK"), (0, 45, "TS_DUPLICATE"))
+        out = cooling_mod.build_segments(pts, 50.0, gap_threshold_minutes=10)
+        self.assertIsNone(out["current"])
+        self.assertEqual(out["segments"][-1]["held_minutes"], 15.0)
+        self.assertEqual(out["interruptions"][-1]["code"], "TS_DUPLICATE")
+        # 重复点之后新到读数（09:20）重新锚段，不与中断前拼接
+        pts2 = pts + self._pts((20, 45, "OK"), (25, 45, "OK"))
+        out2 = cooling_mod.build_segments(pts2, 50.0, gap_threshold_minutes=10)
+        self.assertEqual(out2["current"]["start"], ts(20))
+        self.assertEqual(out2["current"]["held_minutes"], 5.0)
 
 
 if __name__ == "__main__":

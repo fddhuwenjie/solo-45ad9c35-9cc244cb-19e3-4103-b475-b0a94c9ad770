@@ -56,7 +56,7 @@ class BlackoutTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.app = create_app({"DATABASE": os.path.join(self.tmp.name, "t.sqlite"),
-                               "TESTING": True})
+                               "TESTING": True, "REQUIRE_PACK_LIMIT_AT_ISSUE": False})
         self.c = self.app.test_client()
 
     def tearDown(self):
@@ -392,7 +392,7 @@ class OvenSelectionTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self._tmps.append(tmp)
         app = create_app({"DATABASE": os.path.join(tmp.name, "t.sqlite"),
-                          "TESTING": True})
+                          "TESTING": True, "REQUIRE_PACK_LIMIT_AT_ISSUE": False})
         return app.test_client()
 
     @staticmethod

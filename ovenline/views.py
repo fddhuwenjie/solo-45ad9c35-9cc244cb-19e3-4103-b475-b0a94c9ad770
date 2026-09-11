@@ -511,8 +511,17 @@ def _workpiece_state(db, wid):
     return row["status"] if row else None
 
 
-def _cooling_thresholds(db, item):
-    """该件签发时冻结的包装冷却门限（已签收取快照；草稿回退当前粉料主数据）。"""
+def _cooling_thresholds(db, bid, item):
+    """该件冷却放行门限：**签发后只读取签发时冻结的快照**，不回退粉料主数据。
+
+    快照为空（签发时粉料未登记包装门限）即视为门限缺失：冷却进度与 NORMAL
+    放行据此给出 PACK_LIMIT_MISSING，永不放行——即使签发后再补改粉料主数据。
+    仅未签发草稿（DRAFT/SUPERSEDED）允许回退当前粉料主数据做预览。
+    """
+    state = db.execute("SELECT state FROM batches WHERE id=?",
+                       (bid,)).fetchone()["state"]
+    if state not in ("DRAFT", "SUPERSEDED"):
+        return item["snap_pack_temp_limit_c"], item["snap_low_temp_hold_minutes"]
     if item["snap_pack_temp_limit_c"] is not None:
         return item["snap_pack_temp_limit_c"], item["snap_low_temp_hold_minutes"]
     r = db.execute(
@@ -539,7 +548,7 @@ def _cooling_evaluate(db, bid, item, as_of=None):
     wid = item["workpiece_id"]
     if as_of is None:
         as_of = _now()
-    limit, hold = _cooling_thresholds(db, item)
+    limit, hold = _cooling_thresholds(db, bid, item)
     ev = cooling.evaluate(
         _cooling_readings(db, bid, wid), limit, hold, as_of,
         current_app.config["COOLING_GAP_MINUTES"])
@@ -1758,6 +1767,37 @@ def list_point_faults():
 
 # ---------------------------------------------------------------- 状态机动作
 
+def _pack_threshold_problems(db, b):
+    """签发前包装冷却门限检查：粉料须同时有包装温度上限与低温保持时长。
+
+    缺一门限即逐条列出（PACK_LIMIT_MISSING）阻止签发；门限在签发时冻结，
+    签发后即使补改粉料主数据，本炉次快照仍为空（不得回退主数据放行）。
+    """
+    rows = db.execute(
+        "SELECT bi.workpiece_id, w.powder_batch, p.pack_temp_limit_c,"
+        " p.low_temp_hold_minutes"
+        " FROM batch_items bi JOIN workpieces w ON w.id=bi.workpiece_id"
+        " LEFT JOIN powders p ON p.batch_no=w.powder_batch"
+        " WHERE bi.batch_id=? ORDER BY bi.hanger_slot", (b["id"],)).fetchall()
+    problems = []
+    for r in rows:
+        missing = []
+        if r["pack_temp_limit_c"] is None:
+            missing.append("pack_temp_limit_c")
+        if r["low_temp_hold_minutes"] is None:
+            missing.append("low_temp_hold_minutes")
+        if missing:
+            problems.append({
+                "workpiece_id": r["workpiece_id"],
+                "powder_batch": r["powder_batch"],
+                "code": "PACK_LIMIT_MISSING",
+                "missing_fields": missing,
+                "detail": f"粉料 {r['powder_batch']} 缺少包装冷却门限 "
+                          f"{', '.join(missing)}（包装温度上限/低温保持时长须"
+                          "同时登记），签发后将无冻结门限可用"})
+    return problems
+
+
 def _calibration_problems(db, b):
     """签发前校准检查：逐工件逐探头核对证书绑定、有效期与粉料温区覆盖。
 
@@ -1847,6 +1887,16 @@ def issue(bid):
         return _err(404, f"炉次 {bid} 不存在")
     if b["state"] not in TRANSITIONS["issue"][0]:
         return _err(409, f"炉次状态为 {b['state']}，不能签发（要求 DRAFT）", state=b["state"])
+    # 包装冷却门限检查：粉料必须同时登记包装温度上限与低温保持时长，
+    # 否则冻结快照为空，合格离炉件将永远无法正常放行——签发即明确拒绝。
+    # REQUIRE_PACK_LIMIT_AT_ISSUE=False 时允许签发（快照为空：冷却查询/
+    # NORMAL 放行以 PACK_LIMIT_MISSING 阻塞，且永不回退后来修改的主数据）。
+    if current_app.config.get("REQUIRE_PACK_LIMIT_AT_ISSUE", True):
+        pack_problems = _pack_threshold_problems(db, b)
+        if pack_problems:
+            return _err(409, "粉料缺少包装温度上限/低温保持时长，"
+                             "无法冻结冷却放行门限，阻止签发（补齐粉料资料后重试）",
+                        state=b["state"], pack_threshold_problems=pack_problems)
     # 校准证书检查：登记探头须绑定证书版本，且在计划入炉时刻有效、覆盖粉料温区
     problems = _calibration_problems(db, b)
     if problems:
@@ -2212,9 +2262,10 @@ def add_cooling_readings(bid, wid):
     body: {"readings":[{ts, surface_temp_c}], "at"?: 基准时刻}
     或单条 {ts, surface_temp_c}。
     - 按 (炉次, 工件, 时刻) 幂等去重：同点同温度重复回传计入 duplicates；
-    - **乱序**（ts 早于已收录最新时标）与**同时刻不同温度**读数仍入库并
-      标记 kind（OUT_OF_ORDER / TS_CONFLICT），由冷却区间引擎截断当前连续
-      低温区间；同时刻不同温度另记一条 cooling_interruptions 人工中断；
+    - **乱序**（ts 早于已收录最新时标）、**同时刻不同温度**（TS_CONFLICT）
+      与**时刻和温度完全相同的重复提交**（TS_DUPLICATE，"同点重复"）均照常
+      保存本次提交、标记 kind 并记录区间中断，由冷却区间引擎截断当前连续
+      低温区间、从该点之后重新累计；
     - 测温时刻早于实际离炉时刻一律拒收（离炉前的表面温度不属冷却观测）。
     接受后即时返回该件冷却进度。
     """
@@ -2232,9 +2283,9 @@ def add_cooling_readings(bid, wid):
     if not entries:
         return _err(400, "缺少 readings（或单条 ts/surface_temp_c）")
 
-    accepted = duplicates = conflicts = 0
+    accepted = duplicate_points = conflicts = 0
     rejected = []
-    stored = []   # 本次新收录（含乱序/冲突），用于按到达顺序即时反馈
+    stored = []   # 本次新收录（含乱序/同点重复），用于按到达顺序即时反馈
     unloaded_at = (datetime.fromisoformat(item["actual_unload_at"])
                    if item["actual_unload_at"] else None)
     for e in entries:
@@ -2259,15 +2310,8 @@ def add_cooling_readings(bid, wid):
                              "reason": f"测温时刻早于实际离炉时刻 "
                                        f"{item['actual_unload_at']}，不予收录"})
             continue
-        # 同点同温度（完全一致的 (时刻, 温度)）= 幂等重复，不重复入库；
-        # 同点不同温度（"同点重复"）= TS_CONFLICT，照常收录并截断区间
-        exact = db.execute(
-            "SELECT id FROM cooling_readings WHERE batch_id=? AND workpiece_id=?"
-            " AND ts=? AND ABS(surface_temp_c-?)<1e-9",
-            (bid, wid, ts.isoformat(), temp)).fetchone()
-        if exact is not None:
-            duplicates += 1
-            continue
+        # 时刻相同：温度不同 TS_CONFLICT、温度相同 TS_DUPLICATE。
+        # 二者都是"同点重复"：本次提交照常保存并截断区间（不做幂等忽略）。
         prior = _cooling_readings(db, bid, wid) + stored
         kind, prev_ts = cooling.admit(prior, ts, temp)
         created = _now().isoformat()
@@ -2289,7 +2333,13 @@ def add_cooling_readings(bid, wid):
                 detail = (f"同时刻 {ts.isoformat(timespec='seconds')} 重复上报"
                           f"不同表面温度：既有 "
                           f"{prev_temp['surface_temp_c']:g}℃、新读数 {temp:g}℃，"
-                          "该时刻温度不可信，当前连续低温区间截断")
+                          "该时刻温度不可信，当前连续低温区间截断，"
+                          "从该点之后重新累计")
+            elif kind == cooling.KIND_TS_DUPLICATE:
+                duplicate_points += 1
+                detail = (f"同时刻 {ts.isoformat(timespec='seconds')} 重复提交"
+                          f"相同表面温度 {temp:g}℃（同点重复），当前连续低温"
+                          "区间截断，从该点之后重新累计")
             else:
                 detail = (f"读数乱序：{ts.isoformat(timespec='seconds')} 早于已收录最新"
                           f"时刻 {prev_ts.isoformat(timespec='seconds') if prev_ts else '-'}，"
@@ -2306,7 +2356,9 @@ def add_cooling_readings(bid, wid):
     item = _cooling_item(db, bid, wid)
     ev = _cooling_evaluate(db, bid, item, as_of)
     return jsonify({"batch_id": bid, "workpiece_id": wid,
-                    "accepted": accepted, "duplicates": duplicates,
+                    "accepted": accepted,
+                    # duplicates = 同点重复（时刻+温度完全相同）：已保存并截断区间
+                    "duplicates": duplicate_points,
                     "conflicts": conflicts, "rejected": rejected,
                     "cooling": ev})
 

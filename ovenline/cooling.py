@@ -11,8 +11,10 @@
 
 - **乱序** `OUT_OF_ORDER`：新读数时标早于已收录最新时标（时间倒流，
   无法证明中间时刻的温度）；
-- **同时刻不同温度** `TS_CONFLICT`：同一时标出现与已收录值不一致的
-  温度（同点重复且同温度视为幂等重复，入库前去重，不产生中断）；
+- **同点重复** `TS_CONFLICT` / `TS_DUPLICATE`：同一时标再次上报——
+  温度不同为 `TS_CONFLICT`，**温度完全相同**为 `TS_DUPLICATE`；两种重复
+  都照常保存本次提交并截断区间（重复点不锚新区间，从该点**之后**的读数
+  重新累计连续低温时长）；
 - **采样间隔过长** `LONG_GAP`：相邻读数间隔超过 `gap_threshold_minutes`
   （缺报期间温度无法验证，此前连续保持作废，与固化判定同一保守口径）；
 - **再次升温** `REHEAT`：读数温度高于包装耐温上限（重新变热，
@@ -30,10 +32,12 @@ from datetime import timedelta
 KIND_OK = "OK"
 KIND_OUT_OF_ORDER = "OUT_OF_ORDER"
 KIND_TS_CONFLICT = "TS_CONFLICT"
+KIND_TS_DUPLICATE = "TS_DUPLICATE"   # 同点重复（同时刻同温度）：照常收录并截断
 
 # 区间中断原因代码
 BREAK_OUT_OF_ORDER = "OUT_OF_ORDER"   # 乱序读数截断区间
 BREAK_TS_CONFLICT = "TS_CONFLICT"     # 同时刻不同温度截断区间
+BREAK_TS_DUPLICATE = "TS_DUPLICATE"   # 同时刻同温度重复上报截断区间
 BREAK_LONG_GAP = "LONG_GAP"           # 采样间隔过长截断区间
 BREAK_REHEAT = "REHEAT"               # 再次升温（高于包装耐温上限）截断区间
 
@@ -54,16 +58,18 @@ def admit(readings, new_ts, new_temp):
 
     readings: 已收录 [(ts datetime, temp, kind), ...]，按收录（到达）顺序
     返回 (kind, prev_ts)：
-      OK               —— 正常新读数（含同点同温度的幂等重复，调用方据此去重）
+      OK               —— 正常新读数
       OUT_OF_ORDER     —— new_ts 早于已收录最新时标
       TS_CONFLICT      —— 同一时标已收录但温度不同
-    prev_ts 为冲突/截断时引用的已收录最新时标（正常时为时间上前一条）。
+      TS_DUPLICATE     —— 同一时标已有完全相同温度（同点重复：不幂等忽略，
+                          照常收录并由 build_segments 截断区间，从该点后重算）
+    prev_ts 为截断时引用的已收录最新时标（正常时为时间上前一条）。
     """
     prev_ts = None
     for ts, temp, _kind in readings:
         if ts == new_ts:
             if temp == new_temp:
-                return KIND_OK, ts
+                return KIND_TS_DUPLICATE, ts
             return KIND_TS_CONFLICT, ts
         if prev_ts is None or ts > prev_ts:
             prev_ts = ts
@@ -77,7 +83,7 @@ def build_segments(readings, pack_temp_limit, gap_threshold_minutes=10):
 
     readings: [(ts datetime, temp float, kind str), ...]，**按收录顺序**
               （id 升序），kind 为收录时标记（OK/OUT_OF_ORDER/TS_CONFLICT）。
-              同点同温度的幂等重复不应出现在这里（入库前去重）。
+              同点重复（TS_DUPLICATE/TS_CONFLICT）照常出现在序列中并截断区间。
     pack_temp_limit: 包装耐温上限 ℃；None 时不构建区间（门限缺失）。
     返回 dict：segments（所有已结束/进行中的低温段）、current（当前连续
               低温区间，无则 None）、interruptions（区间中断明细）。
@@ -107,9 +113,13 @@ def build_segments(readings, pack_temp_limit, gap_threshold_minutes=10):
         return {"segments": [], "current": None, "interruptions": []}
 
     for ts, temp, kind in readings:
-        if kind == KIND_TS_CONFLICT:
-            # 同时刻不同温度：该时刻温度不可信，截断区间（不锚新区间）
-            _close(ts, BREAK_TS_CONFLICT, {"at": _iso(ts), "temp_c": temp})
+        if kind in (KIND_TS_CONFLICT, KIND_TS_DUPLICATE):
+            # 同点重复（温度不同或完全相同）：本次提交照常保存，但该时刻
+            # 不能与前后拼接——截断当前区间且重复点不锚新区间；下一条
+            # 正常读数从该点之后重新累计（prev 已含此时标）
+            code = (BREAK_TS_CONFLICT if kind == KIND_TS_CONFLICT
+                    else BREAK_TS_DUPLICATE)
+            _close(ts, code, {"at": _iso(ts), "temp_c": temp})
             prev = ts if prev is None or ts > prev else prev
             continue
         if kind == KIND_OUT_OF_ORDER or (prev is not None and ts < prev):

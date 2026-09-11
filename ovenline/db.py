@@ -136,16 +136,16 @@ CREATE TABLE IF NOT EXISTS batch_items (
 );
 
 -- 冷却测温（表面温度，带时标）：按收录顺序保留，乱序不按时间重排。
--- 同点（同时刻）同温度为幂等重复（应用层去重，不计入也不截断区间）；
--- 同时刻不同温度（TS_CONFLICT，"同点重复"）照常收录并截断当前连续低温区间。
--- 唯一索引按 (炉次, 工件, 时刻, 温度) 保证同点同温度不重复落库。
+-- 同点（同时刻）重复上报——无论温度相同（TS_DUPLICATE）还是不同
+-- （TS_CONFLICT）——都照常保存本次提交并截断当前连续低温区间，
+-- 因此 (时刻, 温度) 不做唯一约束；只对正常新读数计数 accepted。
 CREATE TABLE IF NOT EXISTS cooling_readings (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_id     INTEGER NOT NULL REFERENCES batches(id),
     workpiece_id TEXT NOT NULL,
     ts           TEXT NOT NULL,          -- 测温时刻（ISO，按到达顺序收录）
     surface_temp_c REAL NOT NULL,        -- 工件表面温度
-    kind         TEXT NOT NULL DEFAULT 'OK',  -- OK / OUT_OF_ORDER / TS_CONFLICT
+    kind         TEXT NOT NULL DEFAULT 'OK',  -- OK / OUT_OF_ORDER / TS_CONFLICT / TS_DUPLICATE
     created_at   TEXT NOT NULL           -- 收录（到达）时刻：乱序判定依据
 );
 
@@ -416,30 +416,11 @@ def init_db():
     existing = {r["name"] for r in db.execute("PRAGMA table_info(batches)")}
     if "arrangement_json" not in existing:
         db.execute("ALTER TABLE batches ADD COLUMN arrangement_json TEXT")
-    # 兼容旧库：冷却放行功能上线前已离炉合格的工件视为已正常放行，
-    # 补回填 release_actions 与 batch_items 放行列，保证「结案须引用一次
-    # 有效放行」与历史档案完整；强制出炉（NOT_OK）件不补，仍走返工处置
-    existing = {r["name"] for r in db.execute("PRAGMA table_info(batch_items)")}
-    if {"release_kind", "release_at"} <= existing:
-        db.execute(
-            "UPDATE batch_items SET release_kind='NORMAL',"
-            " release_at=actual_unload_at,"
-            " release_reason='历史合格件迁移补回填'"
-            " WHERE final_verdict='OK' AND actual_unload_at IS NOT NULL"
-            " AND release_kind IS NULL")
-        db.execute(
-            "INSERT OR IGNORE INTO release_actions"
-            " (batch_id, workpiece_id, kind, release_at, reason, held_minutes,"
-            " snapshot_json, created_at)"
-            " SELECT batch_id, workpiece_id, 'NORMAL', actual_unload_at,"
-            " '历史合格件迁移补回填', NULL, '{}', actual_unload_at"
-            " FROM batch_items WHERE final_verdict='OK'"
-            " AND actual_unload_at IS NOT NULL")
-    # 冷却测温幂等索引：同 (炉次, 工件, 时刻, 温度) 重复回传不重复入库；
-    # 同时刻不同温度（TS_CONFLICT）是不同行，照常收录并截断区间
-    db.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_cooling_dedup ON cooling_readings"
-        " (batch_id, workpiece_id, ts, surface_temp_c)")
+    # 注意：历史合格件不补造放行记录——签发快照缺少包装冷却门限的炉次
+    # 不得凭主数据/迁移变为已放行；冷却放行门限缺失只能由新炉次补登记后重排。
+    # 冷却测温：同点重复（时刻+温度相同）也须保存本次提交并截断区间，
+    # 故不建 (时刻, 温度) 唯一索引；若旧库建过去重索引则删除
+    db.execute("DROP INDEX IF EXISTS idx_cooling_dedup")
     db.commit()
 
 
