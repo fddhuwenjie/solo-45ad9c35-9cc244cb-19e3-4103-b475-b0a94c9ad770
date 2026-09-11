@@ -13,6 +13,8 @@ def create_app(test_config=None):
         PROBE_DIVERGENCE_C=5.0,        # 同一时刻有效探头校正值极差超过该温度记为温差异常
         STUCK_PROBE_MIN_CONSECUTIVE=5,  # 同一探头连续相同读数达到该点数记为卡值
         MIN_VALID_PROBES=1,            # 判定合格所需的最少有效探头数
+        COOLING_GAP_MINUTES=10,        # 冷却测温采样间隔超过该分钟数即截断低温区间，
+                                       # 最新读数距基准时刻超过该值视为陈旧不得放行
     )
     if test_config:
         app.config.update(test_config)

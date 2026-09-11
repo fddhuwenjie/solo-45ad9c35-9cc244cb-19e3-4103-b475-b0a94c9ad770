@@ -1,7 +1,7 @@
 # 粉末喷涂烘炉固化排产系统（ovenline）
 
 本地 REST API：Python + Flask + SQLite，覆盖粉末固化生产的**排产 → 签发 → 入炉 →
-测温回传 → 出炉判定 → 返工结案**全流程。
+测温回传 → 出炉判定 → 冷却放行 → 返工结案**全流程。
 
 核心原则：**空气温度到达设定值不代表固化开始**——系统按每件工件金属探头温度处于
 许可区间的**累计分钟数**判定固化是否充分；混炉须同时满足各粉料固化窗口交集、
@@ -43,6 +43,7 @@ bash samples/scenario_d_piece_unload.sh       # 轻薄/厚重混炉逐件出炉�
 bash samples/scenario_e_blackout.sh           # 停机窗避让/冲突/逐炉时间线
 bash samples/scenario_f_calibrations.sh       # 探头校准证书版本化/签发检查/插值
 bash samples/scenario_g_racking.sh            # 吊具布置/载荷平衡/人工校验/吊点故障
+bash samples/scenario_h_cooling.sh            # 厚板冷却测温/区间截断/正常与紧急搬运放行
 
 # 回归测试（不依赖服务进程）
 python3 -m unittest discover -s tests -v
@@ -59,6 +60,7 @@ ovenline/
   db.py                    SQLite 连接与建表
   scheduler.py             排产引擎（纯函数）
   cure.py                  固化判定（纯函数）
+  cooling.py               冷却放行：连续低温区间/截断/最早放行时刻（纯函数）
   probes.py                多探头判定：校正/判定序列/异常检测（纯函数）
   progress.py              在炉进度与安全出炉预测（纯函数，基于 probes.analyze）
   views.py                 REST 路由与状态机
@@ -69,6 +71,8 @@ samples/
   scenario_d_piece_unload.sh       样例四：逐件出炉/强制出炉
   scenario_e_blackout.sh           样例五：停机窗避让/冲突/时间线
   scenario_f_calibrations.sh       样例六：校准证书版本化/签发检查/插值
+  scenario_g_racking.sh            样例七：吊具布置/载荷平衡/人工校验/吊点故障
+  scenario_h_cooling.sh            样例八：厚板冷却测温/区间截断/正常与紧急搬运放行
   out/                             样例下载产物（档案 JSON、随炉卡 HTML）
 ```
 
@@ -272,7 +276,8 @@ samples/
 ```
 炉次：DRAFT --签发--> ISSUED --入炉--> IN_OVEN --全部工件离炉--> UNLOADED --结案--> CLOSED
        └ 新试算后旧草稿 --> SUPERSEDED
-工件：PENDING --> SCHEDULED --> IN_OVEN --> DONE ----------> CLOSED
+工件：PENDING --> SCHEDULED --> IN_OVEN --合格离炉--> COOLING --冷却正常放行--> DONE --> CLOSED
+                                   |                     └ 紧急搬运 --> REWORK_PENDING
                                    └--> REWORK_PENDING --返工--> PENDING（is_rework=1）
 ```
 
@@ -298,6 +303,48 @@ samples/
 - 炉次详情、JSON 档案、随炉卡均给出 `unload_order`（离炉顺序、强制原因、
   当时进度快照）；整炉离炉后进度汇总改取逐件离炉时冻结的快照，不再随时间漂移。
 
+### 冷却放行（厚板离炉后包装耐温门限）
+厚板走出炉膛时涂层已固化，但工件**表面温度可能仍高于包装材料耐温上限**；
+按计划时刻直接套膜/堆叠会压出印痕。合格件离炉后进入 **COOLING**（冷却放行
+观察中，**暂不计为完成 DONE**），按带时标的**表面温度**形成连续低温区间：
+- 粉料资料新增两个包装门限（试算 `powders[]`，两者须同时给出、非负）：
+  `pack_temp_limit_c` 包装温度上限、`low_temp_hold_minutes` 低温保持时长；
+  **签发时冻结到工件**（`batch_items.snap_*`），改主数据不影响已签发炉次；
+  未登记门限的粉料：查询/放行以 `PACK_LIMIT_MISSING` 阻塞（紧急搬运除外）。
+- 离炉动作：安全合格件置 **COOLING**（不再直接 DONE），强制/不合格件仍为
+  REWORK_PENDING；炉次仍按「最后一件离炉」转 UNLOADED。
+- **冷却测温写入** `POST /batches/<id>/workpieces/<wid>/cooling-readings`，
+  body `{"readings":[{ts, surface_temp_c}]}`（仅 COOLING 件接收，早于离炉
+  时刻拒收）；按 **(炉次, 工件, 时刻)** 幂等去重，同点同温度重复回传计入
+  `duplicates` 不截断区间；以下情形**截断当前连续低温区间**（此前保持作废）：
+  - **乱序** `OUT_OF_ORDER`：ts 早于已收录最新时标（读数照常入库标记，
+    若本身不超温则锚定新区间）；
+  - **同点重复** `TS_CONFLICT`：同一时刻又报来**不同温度**（读数照常入库
+    标记，该时刻温度不可信，截断区间且不锚新区间）；完全一致的同点同温度
+    回传按幂等重复忽略，不截断；
+  - **采样间隔过长** `LONG_GAP`：相邻读数间隔超过缺报阈值
+    （配置 `COOLING_GAP_MINUTES`，默认 10 分钟）；
+  - **再次升温** `REHEAT`：读数高于包装温度上限，下一条低温读数另起新区间。
+  区间有效保持按保守口径：相邻两点**都**不超温，该区间时长才计入。
+- **进度查询** `GET /batches/<id>/workpieces/<wid>/cooling`（可带 `?as_of=`）
+  给出：当前读数（时刻/表面温度/收录标记/新鲜度）、当前连续区间有效保持分钟
+  `held_low_temp_minutes`、剩余 `remaining_hold_minutes`、按当前连续区间
+  计算的**最早放行时刻** `earliest_release_at`（=最新读数+剩余保持，读数陈旧
+  或最新超温时不给）、**未满足项** `unmet`
+  （PACK_LIMIT_MISSING/NO_READING/REHEAT/HOLD_NOT_MET/STALE_READING），
+  以及完整的已闭合区间与区间中断追溯；炉次级 `GET /batches/<id>/cooling`
+  逐件汇总冷却中/已放行/紧急搬运计数。
+- **搬运放行** `POST /batches/<id>/workpieces/<wid>/release`：
+  - 正常放行（缺省）：COOLING 且门限已满足才成功（工件 → **DONE**）；
+    **未达门限返回 409**，响应给有效保持分钟、最早放行时刻与未满足项，
+    不留放行记录；
+  - **紧急搬运** `{"emergency": true, "reason": "..."}`（理由必填）：
+    不看门限，工件送**返工处置**（→ REWORK_PENDING，落 EMERGENCY_RELEASE
+    标记与 `release_actions` 审计），再经返工接口回待排产队列。
+- **结案须引用一次有效放行**：仍在 COOLING / REWORK_PENDING 的工件阻止炉次
+  结案（409 列出）；DONE 件必须存在 NORMAL 放行记录。
+- 批次详情/JSON 档案/随炉卡/工件履历均保留：**冻结门限、完整表面读数
+  （含乱序标记）、区间中断、人工搬运决定与放行时冷却快照**（`release_order`）。
 
 ### 版本机制
 每次试算生成一个 `schedule_versions` 记录（`parent_id` 指向上版本，参数快照存档）：
@@ -325,8 +372,12 @@ samples/
 | POST | `/batches/<id>/readings` | 测温回传（仅 IN_OVEN 且工件仍在炉），`readings:[{workpiece_id,probe_id,ts,metal_temp_c}]`，接受后即时重算进度 |
 | GET  | `/batches/<id>/progress` | 在炉固化进度与安全出炉预测（可带 `?as_of=` 计算基准，逐件状态/阻塞/告警，炉次级最晚安全出炉与计划过早分钟）；**汇总仅计算仍在炉工件** |
 | POST | `/batches/<id>/workpieces/<wid>/unload` | **逐件出炉**：按 `at` 判定单件；不达标普通请求 409（给累计/剩余/阻塞原因），`force=true`+`reason` 强制出炉（不合格+审计） |
-| POST | `/batches/<id>/unload` | 整炉出炉判定：逐件复用同一判定，**已离炉工件跳过**；最后一件离炉后炉次 UNLOADED |
-| POST | `/batches/<id>/close` | 炉次结案（存在未了结工件时 409 并列出） |
+| POST | `/batches/<id>/unload` | 整炉出炉判定：逐件复用同一判定，**已离炉工件跳过**；最后一件离炉后炉次 UNLOADED；合格件进入 COOLING（暂不完成） |
+| POST | `/batches/<id>/workpieces/<wid>/cooling-readings` | **冷却测温写入**：仅 COOLING 件，`readings:[{ts,surface_temp_c}]`；同点幂等去重，乱序/同时刻冲突/长间隔/再次升温截断连续低温区间 |
+| GET  | `/batches/<id>/workpieces/<wid>/cooling` | **单工件冷却进度**：当前读数、当前区间有效保持分钟、最早放行时刻、未满足项、区间中断追溯（可带 `?as_of=`） |
+| GET  | `/batches/<id>/cooling` | **炉次冷却汇总**：逐件冷却状态与冷却中/已放行/紧急搬运计数 |
+| POST | `/batches/<id>/workpieces/<wid>/release` | **冷却搬运放行**：门限满足正常放行（→DONE）；未达门限 409；`emergency=true`+`reason` 紧急搬运送返工（→REWORK_PENDING） |
+| POST | `/batches/<id>/close` | 炉次结案（COOLING/REWORK_PENDING 工件或 DONE 无有效放行记录时 409 并列出） |
 | POST | `/workpieces/<id>/probes` | 登记/更新工件探头及校准偏移，可带 `calibration_id` 绑定校准版本（签发时冻结快照） |
 | GET  | `/workpieces/<id>/probes` | 工件已登记探头列表（含绑定的证书版本摘要） |
 | POST | `/workpieces/<wid>/probes/<pid>/calibrations` | 录入探头校准证书版本（不可覆盖；少于两点/时间倒置/点列不递增拒绝） |
@@ -351,6 +402,7 @@ samples/
 | `PROBE_DIVERGENCE_C` | 5.0 | 同一时刻有效探头校正值极差超过该温度记为温差异常 |
 | `STUCK_PROBE_MIN_CONSECUTIVE` | 5 | 同一探头连续相同读数达到该点数记为卡值 |
 | `MIN_VALID_PROBES` | 1 | 判定合格所需的最少有效探头数 |
+| `COOLING_GAP_MINUTES` | 10 | 冷却测温采样间隔超过该分钟数截断低温区间；最新读数距基准时刻超过该值视为陈旧不得放行 |
 
 ### 试算请求体要点
 
@@ -369,7 +421,8 @@ samples/
                  "beam_max_load_kg?","moment_tolerance_kg_mm?",
                  "moment_tolerance_ratio?","default_clearance_mm?",
                  "lug_tolerance_mm?"}}],
-  "powders": [{"batch_no","temp_min_c","temp_max_c","hold_minutes"}],
+  "powders": [{"batch_no","temp_min_c","temp_max_c","hold_minutes",
+               "pack_temp_limit_c"?,"low_temp_hold_minutes"?}],
   "forbidden_pairs": [["GRP_A","GRP_B"]],
   "blackout_windows": [{"oven_id","kind","start_at","end_at","note"}],
   "hanger_blackouts": [{"oven_id","rod_id","point_index","start_at","end_at?","note?"}],

@@ -30,7 +30,12 @@ CREATE TABLE IF NOT EXISTS powders (
     batch_no     TEXT PRIMARY KEY,
     temp_min_c   REAL NOT NULL,   -- 固化窗口下限（金属温度）
     temp_max_c   REAL NOT NULL,   -- 固化窗口上限
-    hold_minutes REAL NOT NULL    -- 窗口内需保持的分钟数
+    hold_minutes REAL NOT NULL,   -- 窗口内需保持的分钟数
+    -- 冷却放行门限（包装材料耐温）：离炉后表面温度须连续不高于
+    -- pack_temp_limit_c 并保持 low_temp_hold_minutes 分钟；
+    -- NULL = 粉料未登记该门限（冷却查询/放行以 MISSING 门限阻塞）
+    pack_temp_limit_c    REAL,
+    low_temp_hold_minutes REAL
 );
 
 CREATE TABLE IF NOT EXISTS workpieces (
@@ -46,7 +51,8 @@ CREATE TABLE IF NOT EXISTS workpieces (
     is_rework    INTEGER NOT NULL DEFAULT 0,
     status       TEXT NOT NULL DEFAULT 'PENDING',
     -- PENDING 待排产 / SCHEDULED 已排入炉次 / IN_OVEN 在炉
-    -- DONE 判定合格 / REWORK_PENDING 待返工 / CLOSED 已结案
+    -- COOLING 已离炉合格件，冷却放行观察中（暂不计为完成）
+    -- DONE 冷却放行完成 / REWORK_PENDING 待返工 / CLOSED 已结案
     -- 吊具布置：重心相对工件几何中心的沿杆/横向偏移、可旋转方向、
     -- 吊耳沿长轴坐标（相对工件中心）、与相邻工件的要求净距
     cg_offset_x_mm REAL NOT NULL DEFAULT 0,
@@ -110,6 +116,9 @@ CREATE TABLE IF NOT EXISTS batch_items (
     snap_temp_min_c   REAL,
     snap_temp_max_c   REAL,
     snap_hold_minutes REAL,
+    -- 签发时冻结的包装冷却门限（来自粉料主数据，签发后不再随主数据变化）
+    snap_pack_temp_limit_c     REAL,  -- 包装耐温上限（表面温度须 <= 该值）
+    snap_low_temp_hold_minutes REAL,  -- 连续低温保持要求分钟数
     -- 逐件出炉：NULL 表示仍在炉；最后一件离炉后炉次转 UNLOADED
     actual_unload_at      TEXT,      -- 该件实际离炉时刻
     unload_sequence       INTEGER,   -- 炉内离炉顺序（1 起，按实际离炉先后）
@@ -118,7 +127,52 @@ CREATE TABLE IF NOT EXISTS batch_items (
     forced                INTEGER NOT NULL DEFAULT 0,  -- 是否强制出炉
     force_reason          TEXT,      -- 强制出炉原因（强制时必填）
     progress_snapshot_json TEXT,     -- 离炉当时该件进度快照（project_item 结果）
+    -- 冷却搬运放行：合格件离炉即 COOLING，正常放行后才 DONE；紧急搬运转返工
+    release_kind   TEXT,             -- NORMAL 正常放行 / EMERGENCY 紧急搬运
+    release_at     TEXT,             -- 放行时刻
+    release_reason TEXT,             -- 紧急搬运理由（紧急时必填）
+    release_snapshot_json TEXT,      -- 放行当时冷却进度快照（cooling.evaluate 结果）
     PRIMARY KEY (batch_id, workpiece_id)
+);
+
+-- 冷却测温（表面温度，带时标）：按收录顺序保留，乱序不按时间重排。
+-- 同点（同时刻）同温度为幂等重复（应用层去重，不计入也不截断区间）；
+-- 同时刻不同温度（TS_CONFLICT，"同点重复"）照常收录并截断当前连续低温区间。
+-- 唯一索引按 (炉次, 工件, 时刻, 温度) 保证同点同温度不重复落库。
+CREATE TABLE IF NOT EXISTS cooling_readings (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id     INTEGER NOT NULL REFERENCES batches(id),
+    workpiece_id TEXT NOT NULL,
+    ts           TEXT NOT NULL,          -- 测温时刻（ISO，按到达顺序收录）
+    surface_temp_c REAL NOT NULL,        -- 工件表面温度
+    kind         TEXT NOT NULL DEFAULT 'OK',  -- OK / OUT_OF_ORDER / TS_CONFLICT
+    created_at   TEXT NOT NULL           -- 收录（到达）时刻：乱序判定依据
+);
+
+-- 冷却区间人工中断记录：区间只能由数据本身（乱序/缺报/再次升温）截断，
+-- 同时刻不同温度的冲突读数记一条人工可追溯的区间中断
+CREATE TABLE IF NOT EXISTS cooling_interruptions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id     INTEGER NOT NULL,
+    workpiece_id TEXT NOT NULL,
+    code         TEXT NOT NULL,          -- TS_CONFLICT
+    at_ts        TEXT NOT NULL,          -- 冲突读数时标
+    detail       TEXT,
+    created_at   TEXT NOT NULL
+);
+
+-- 冷却搬运放行审计：正常放行（合格件 -> DONE）/ 紧急搬运（-> 返工处置）
+CREATE TABLE IF NOT EXISTS release_actions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id     INTEGER NOT NULL,
+    workpiece_id TEXT NOT NULL,
+    kind         TEXT NOT NULL,          -- NORMAL / EMERGENCY
+    release_at   TEXT NOT NULL,
+    reason       TEXT,                   -- 紧急搬运理由（紧急时必填）
+    held_minutes REAL,                   -- 放行当时当前连续区间有效保持分钟
+    snapshot_json TEXT NOT NULL,         -- 放行当时冷却进度快照
+    created_at   TEXT NOT NULL,
+    UNIQUE (batch_id, workpiece_id)      -- 每件每炉次只能放行一次
 );
 
 CREATE TABLE IF NOT EXISTS readings (
@@ -288,15 +342,25 @@ def init_db():
                      "snap_height_mm": "REAL", "snap_weight_kg": "REAL",
                      "snap_powder_batch": "TEXT", "snap_temp_min_c": "REAL",
                      "snap_temp_max_c": "REAL", "snap_hold_minutes": "REAL",
+                     "snap_pack_temp_limit_c": "REAL",
+                     "snap_low_temp_hold_minutes": "REAL",
                      "actual_unload_at": "TEXT", "unload_sequence": "INTEGER",
                      "first_met_at": "TEXT", "final_verdict": "TEXT",
                      "forced": "INTEGER NOT NULL DEFAULT 0",
                      "force_reason": "TEXT", "progress_snapshot_json": "TEXT",
+                     "release_kind": "TEXT", "release_at": "TEXT",
+                     "release_reason": "TEXT", "release_snapshot_json": "TEXT",
                      "rod_id": "TEXT", "load_in_sequence": "INTEGER",
                      "placement_json": "TEXT"}
     for col, typ in snapshot_cols.items():
         if col not in existing:
             db.execute(f"ALTER TABLE batch_items ADD COLUMN {col} {typ}")
+    # 兼容旧库：powders 补包装冷却门限列
+    existing = {r["name"] for r in db.execute("PRAGMA table_info(powders)")}
+    for col, typ in {"pack_temp_limit_c": "REAL",
+                     "low_temp_hold_minutes": "REAL"}.items():
+        if col not in existing:
+            db.execute(f"ALTER TABLE powders ADD COLUMN {col} {typ}")
     # 兼容旧库：已整炉出炉的历史炉次按实际出炉时刻回填逐件离炉列
     db.execute(
         "UPDATE batch_items SET actual_unload_at=("
@@ -352,6 +416,30 @@ def init_db():
     existing = {r["name"] for r in db.execute("PRAGMA table_info(batches)")}
     if "arrangement_json" not in existing:
         db.execute("ALTER TABLE batches ADD COLUMN arrangement_json TEXT")
+    # 兼容旧库：冷却放行功能上线前已离炉合格的工件视为已正常放行，
+    # 补回填 release_actions 与 batch_items 放行列，保证「结案须引用一次
+    # 有效放行」与历史档案完整；强制出炉（NOT_OK）件不补，仍走返工处置
+    existing = {r["name"] for r in db.execute("PRAGMA table_info(batch_items)")}
+    if {"release_kind", "release_at"} <= existing:
+        db.execute(
+            "UPDATE batch_items SET release_kind='NORMAL',"
+            " release_at=actual_unload_at,"
+            " release_reason='历史合格件迁移补回填'"
+            " WHERE final_verdict='OK' AND actual_unload_at IS NOT NULL"
+            " AND release_kind IS NULL")
+        db.execute(
+            "INSERT OR IGNORE INTO release_actions"
+            " (batch_id, workpiece_id, kind, release_at, reason, held_minutes,"
+            " snapshot_json, created_at)"
+            " SELECT batch_id, workpiece_id, 'NORMAL', actual_unload_at,"
+            " '历史合格件迁移补回填', NULL, '{}', actual_unload_at"
+            " FROM batch_items WHERE final_verdict='OK'"
+            " AND actual_unload_at IS NOT NULL")
+    # 冷却测温幂等索引：同 (炉次, 工件, 时刻, 温度) 重复回传不重复入库；
+    # 同时刻不同温度（TS_CONFLICT）是不同行，照常收录并截断区间
+    db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_cooling_dedup ON cooling_readings"
+        " (batch_id, workpiece_id, ts, surface_temp_c)")
     db.commit()
 
 

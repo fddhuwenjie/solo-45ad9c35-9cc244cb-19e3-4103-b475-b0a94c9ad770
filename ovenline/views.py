@@ -18,7 +18,7 @@ from datetime import datetime, timedelta
 
 from flask import Blueprint, Response, current_app, jsonify, request
 
-from . import probes, progress, racking, scheduler
+from . import cooling, probes, progress, racking, scheduler
 from .db import get_db
 
 bp = Blueprint("api", __name__)
@@ -40,6 +40,7 @@ FLAG_PROBE_DIVERGENCE = "PROBE_DIVERGENCE"  # 探头温差：有效探头间温�
 FLAG_INSUFFICIENT_PROBES = "INSUFFICIENT_PROBES"  # 有效探头数不足，不得判定合格
 FLAG_UNISSUED_UNLOAD = "UNISSUED_UNLOAD"    # 未签发出炉
 FLAG_INCOMPAT = "INCOMPAT_CONFLICT"         # 禁配冲突
+FLAG_EMERGENCY_RELEASE = "EMERGENCY_RELEASE"  # 冷却未达门限紧急搬运，转返工处置
 
 # 校准证书签发检查代码（命中即阻止签发）
 CAL_MISSING = "CALIBRATION_MISSING"              # 绑定的校准版本缺失
@@ -54,6 +55,10 @@ _KIND_ALIASES = {v: k for k, v in BLACKOUT_KINDS.items()}
 # 吊点禁用类型：临时封位（清炉/检修时挂位不可用）/ 吊点故障
 HANGER_BLACKOUT = "BLACKOUT"
 HANGER_FAULT = "FAULT"
+
+# 冷却搬运放行类型：正常放行（合格件 -> DONE）/ 紧急搬运（-> 返工处置）
+RELEASE_NORMAL = "NORMAL"
+RELEASE_EMERGENCY = "EMERGENCY"
 
 
 # ---------------------------------------------------------------- 工具
@@ -329,19 +334,21 @@ def _apply_piece_unload(db, bid, wid, judgment, at, forced, reason):
     """执行单件离炉：写标记/工件状态/逐件离炉列/审计；返回离炉结果 dict。
 
     强制出炉：最终判定一律 NOT_OK（REWORK_PENDING），并保留所有已观测
-    不合格标记；普通安全出炉：无标记，最终判定 OK（DONE）。
+    不合格标记；普通安全出炉：无标记，最终判定 OK，工件进入 **COOLING**
+    冷却放行观察（离炉只是走出炉膛，表面仍可能高于包装耐温上限，
+    暂不计为完成；冷却正常放行后才 DONE）。
     """
     at_iso = at.isoformat()
     codes = []
     for code, detail in judgment["defects"]:
         _add_flag(db, bid, wid, code, detail)
         codes.append(code)
-    # 强制出炉一律标记不合格；普通离炉以安全条件为准
+    # 强制出炉一律标记不合格；合格离炉进入冷却放行（COOLING），不直接完成
     if forced:
         verdict, wstatus = "NOT_OK", "REWORK_PENDING"
     else:
         verdict = "OK" if judgment["safe"] else "NOT_OK"
-        wstatus = "DONE" if judgment["safe"] else "REWORK_PENDING"
+        wstatus = "COOLING" if judgment["safe"] else "REWORK_PENDING"
     seq_row = db.execute(
         "SELECT COALESCE(MAX(unload_sequence), 0) AS n FROM batch_items"
         " WHERE batch_id=?", (bid,)).fetchone()
@@ -489,7 +496,158 @@ def _frozen_progress(db, b, computed_at=None):
                               computed_at or _now(), "actual_unload_at")
 
 
+# ---------------------------------------------------------------- 冷却放行
+
+def _cooling_item(db, bid, wid):
+    """取炉次工件行（含离炉/放行列）；不存在返回 None。"""
+    return db.execute(
+        "SELECT * FROM batch_items WHERE batch_id=? AND workpiece_id=?",
+        (bid, wid)).fetchone()
+
+
+def _workpiece_state(db, wid):
+    row = db.execute("SELECT status FROM workpieces WHERE id=?",
+                     (wid,)).fetchone()
+    return row["status"] if row else None
+
+
+def _cooling_thresholds(db, item):
+    """该件签发时冻结的包装冷却门限（已签收取快照；草稿回退当前粉料主数据）。"""
+    if item["snap_pack_temp_limit_c"] is not None:
+        return item["snap_pack_temp_limit_c"], item["snap_low_temp_hold_minutes"]
+    r = db.execute(
+        "SELECT p.pack_temp_limit_c, p.low_temp_hold_minutes"
+        " FROM workpieces w LEFT JOIN powders p ON p.batch_no=w.powder_batch"
+        " WHERE w.id=?", (item["workpiece_id"],)).fetchone()
+    if r is None:
+        return None, None
+    return r["pack_temp_limit_c"], r["low_temp_hold_minutes"]
+
+
+def _cooling_readings(db, bid, wid):
+    """冷却表面温度读数（按收录/id 升序，乱序不重排），供区间引擎处理。"""
+    rows = db.execute(
+        "SELECT ts, surface_temp_c, kind FROM cooling_readings"
+        " WHERE batch_id=? AND workpiece_id=? ORDER BY id",
+        (bid, wid)).fetchall()
+    return [(datetime.fromisoformat(r["ts"]), float(r["surface_temp_c"]),
+             r["kind"]) for r in rows]
+
+
+def _cooling_evaluate(db, bid, item, as_of=None):
+    """单件冷却放行评估（cooling.evaluate 结果，附工件/离炉/放行上下文）。"""
+    wid = item["workpiece_id"]
+    if as_of is None:
+        as_of = _now()
+    limit, hold = _cooling_thresholds(db, item)
+    ev = cooling.evaluate(
+        _cooling_readings(db, bid, wid), limit, hold, as_of,
+        current_app.config["COOLING_GAP_MINUTES"])
+    ev["workpiece_id"] = wid
+    ev["batch_id"] = bid
+    ev["unloaded_at"] = item["actual_unload_at"]
+    ev["release"] = None
+    if item["release_kind"] is not None:
+        ev["release"] = {"kind": item["release_kind"],
+                         "release_at": item["release_at"],
+                         "reason": item["release_reason"]}
+    return ev
+
+
+def _cooling_reading_view(db, bid, wid):
+    """该件完整冷却表面温度读数（按收录顺序，含乱序/冲突标记）与中断记录。"""
+    readings = [
+        {"ts": r["ts"], "surface_temp_c": r["surface_temp_c"], "kind": r["kind"],
+         "created_at": r["created_at"]}
+        for r in db.execute(
+            "SELECT ts, surface_temp_c, kind, created_at FROM cooling_readings"
+            " WHERE batch_id=? AND workpiece_id=? ORDER BY id",
+            (bid, wid)).fetchall()]
+    interruptions = [
+        {"code": r["code"], "at_ts": r["at_ts"], "detail": r["detail"],
+         "created_at": r["created_at"]}
+        for r in db.execute(
+            "SELECT code, at_ts, detail, created_at FROM cooling_interruptions"
+            " WHERE batch_id=? AND workpiece_id=? ORDER BY id",
+            (bid, wid)).fetchall()]
+    return readings, interruptions
+
+
+def _item_cooling_view(db, b, it, as_of):
+    """炉次详情/档案中的逐件冷却放行视图（冻结门限+完整读数+区间中断+人工决定）。
+
+    未离炉工件返回 None；已放行件取放行时冻结的冷却快照（不再随时间漂移），
+    其余（COOLING 中）按 as_of 重算。无论哪种情况都附完整读数与中断记录。
+    """
+    bid = b["id"]
+    wid = it["workpiece_id"]
+    if not it["actual_unload_at"]:
+        return None
+    readings, interruptions = _cooling_reading_view(db, bid, wid)
+    release = None
+    if it["release_kind"] is not None:
+        release = {"kind": it["release_kind"], "release_at": it["release_at"],
+                   "reason": it["release_reason"]}
+        snapshot = (json.loads(it["release_snapshot_json"])
+                    if it["release_snapshot_json"] else None)
+    else:
+        snapshot = _cooling_evaluate(db, b["id"], it, as_of)
+    # 区间中断 = 数据计算（乱序/长间隔/再次升温，随读数可复现）
+    # + 落库的同时刻冲突人工中断；按 (code,to) 去重合并
+    if snapshot and snapshot.get("interruptions"):
+        seen = {(x["code"], x.get("to") or x.get("at_ts"))
+                for x in interruptions}
+        for x in snapshot["interruptions"]:
+            key = (x["code"], x.get("to") or x.get("at_ts"))
+            if key not in seen:
+                interruptions.append(x)
+                seen.add(key)
+        interruptions.sort(key=lambda x: x.get("to") or x.get("at_ts") or "")
+    return {
+        "pack_temp_limit_c": it["snap_pack_temp_limit_c"],
+        "low_temp_hold_minutes": it["snap_low_temp_hold_minutes"],
+        "unloaded_at": it["actual_unload_at"],
+        "release": release,
+        "snapshot": snapshot,
+        # 完整读数与区间中断：乱序/长间隔/再次升温/同时刻冲突全程可追溯
+        "readings": readings,
+        "interruptions": interruptions,
+    }
+
+
+def _batch_cooling(db, b, as_of=None):
+    """炉次级冷却放行视图：逐件冷却状态 + 放行统计（含已放行/紧急搬运件）。"""
+    rows = db.execute(
+        "SELECT workpiece_id FROM batch_items WHERE batch_id=?"
+        " ORDER BY unload_sequence, hanger_slot", (b["id"],)).fetchall()
+    items = []
+    for r in rows:
+        it = _cooling_item(db, b["id"], r["workpiece_id"])
+        items.append(_cooling_evaluate(db, b["id"], it, as_of))
+    normal = [i for i in items if (i["release"] or {}).get("kind")
+              == RELEASE_NORMAL]
+    emergency = [i for i in items if (i["release"] or {}).get("kind")
+                 == RELEASE_EMERGENCY]
+    cooling_now = [i for i in items
+                   if not i["release"] and i["unloaded_at"]]
+    waiting = [i for i in cooling_now if not i["releasable"]]
+    return {
+        "basis": {"as_of": (as_of or _now()).isoformat(timespec="seconds")},
+        "cooling_count": len(cooling_now),
+        "released_count": len(normal),
+        "emergency_count": len(emergency),
+        "waiting_count": len(waiting),
+        "all_released": not waiting and len(cooling_now) == 0
+                        and (len(normal) + len(emergency)) > 0,
+        "items": items,
+    }
+
+
 def _batch_payload(db, b, as_of=None, as_of_source=None):
+    resolved_as_of, default_source = _resolve_as_of(b, as_of)
+    basis_source = as_of_source if as_of is not None else default_source
+    # 冷却评估基准时刻：随炉次详情的 as_of 口径；未指定时取当前时刻
+    resolved_cooling_as_of = resolved_as_of if as_of is not None else _now()
     items = db.execute(
         "SELECT bi.workpiece_id, bi.hanger_slot, bi.slots_used, w.order_id,"
         " COALESCE(bi.snap_length_mm, w.length_mm) AS length_mm,"
@@ -500,7 +658,10 @@ def _batch_payload(db, b, as_of=None, as_of_source=None):
         " w.compat_group, w.due_at, w.is_rework, w.status,"
         " bi.actual_unload_at, bi.unload_sequence, bi.first_met_at,"
         " bi.final_verdict, bi.forced, bi.force_reason, bi.progress_snapshot_json,"
-        " bi.rod_id, bi.load_in_sequence, bi.placement_json"
+        " bi.rod_id, bi.load_in_sequence, bi.placement_json,"
+        " bi.snap_pack_temp_limit_c, bi.snap_low_temp_hold_minutes,"
+        " bi.release_kind, bi.release_at, bi.release_reason,"
+        " bi.release_snapshot_json"
         " FROM batch_items bi JOIN workpieces w ON w.id = bi.workpiece_id"
         " WHERE bi.batch_id=? ORDER BY bi.hanger_slot",
         (b["id"],),
@@ -532,7 +693,7 @@ def _batch_payload(db, b, as_of=None, as_of_source=None):
         out_items.append({
             **{k: it[k] for k in it.keys()
                if k not in ("forced", "progress_snapshot_json",
-                            "placement_json")},
+                            "placement_json", "release_snapshot_json")},
             "is_rework": bool(it["is_rework"]),
             "forced": bool(it["forced"]),
             # 吊具布置（挂杆/吊点坐标/旋转/各点载荷/重心；签发后为冻结快照）
@@ -544,9 +705,10 @@ def _batch_payload(db, b, as_of=None, as_of_source=None):
             # 离炉当时冻结的进度快照（在炉时为 None）
             "progress_snapshot": (json.loads(it["progress_snapshot_json"])
                                   if it["progress_snapshot_json"] else None),
+            # 冷却放行：冻结的包装门限、完整表面温度读数与区间中断、
+            # 放行时冻结的冷却快照（未离炉/草稿工件为 None）
+            "cooling": _item_cooling_view(db, b, it, resolved_cooling_as_of),
         })
-    resolved_as_of, default_source = _resolve_as_of(b, as_of)
-    basis_source = as_of_source if as_of is not None else default_source
     # 整炉已离炉且未指定历史基准：逐件取离炉当时冻结快照，不再随时间漂移；
     # 其余情况（在炉/历史复盘）按基准时刻重算，且只汇总仍在炉的工件
     if as_of is None and b["state"] in ("UNLOADED", "CLOSED") \
@@ -576,6 +738,16 @@ def _batch_payload(db, b, as_of=None, as_of_source=None):
             " flags_json, snapshot_json FROM unload_actions"
             " WHERE batch_id=? ORDER BY sequence", (b["id"],)).fetchall()
     ]
+    # 冷却搬运放行记录（正常放行 / 紧急搬运，含理由与放行时冷却快照）
+    release_order = [
+        {"release_id": a["id"], "workpiece_id": a["workpiece_id"],
+         "kind": a["kind"], "release_at": a["release_at"],
+         "reason": a["reason"], "held_low_temp_minutes": a["held_minutes"],
+         "snapshot": json.loads(a["snapshot_json"])}
+        for a in db.execute(
+            "SELECT id, workpiece_id, kind, release_at, reason, held_minutes,"
+            " snapshot_json FROM release_actions"
+            " WHERE batch_id=? ORDER BY id", (b["id"],)).fetchall()]
     return {
         "batch_id": b["id"],
         "version_id": b["version_id"],
@@ -606,6 +778,9 @@ def _batch_payload(db, b, as_of=None, as_of_source=None):
                            if b["schedule_basis_json"] else None),
         "items": out_items,
         "unload_order": unload_order,
+        # 冷却放行：冻结门限/完整读数/区间中断/人工决定随档案保留
+        "release_order": release_order,
+        "cooling": _batch_cooling(db, b, resolved_cooling_as_of),
         # 同一进度快照贯穿炉次详情 / JSON 档案 / 随炉卡
         "progress": progress_snapshot,
     }
@@ -1023,14 +1198,38 @@ def trial():
             return _err(400, f"粉料参数缺少字段: {missing}")
         if float(p["temp_min_c"]) > float(p["temp_max_c"]):
             return _err(400, f"粉料 {p['batch_no']} 温度下限高于上限")
+        # 包装冷却门限（可选）：两者须同时给出且为非负有限数
+        pack_limit = p.get("pack_temp_limit_c")
+        hold_low = p.get("low_temp_hold_minutes")
+        if pack_limit is not None:
+            try:
+                pack_limit = float(pack_limit)
+            except (TypeError, ValueError):
+                return _err(400, f"粉料 {p['batch_no']} 的 pack_temp_limit_c 不是数字")
+        if hold_low is not None:
+            try:
+                hold_low = float(hold_low)
+            except (TypeError, ValueError):
+                return _err(400, f"粉料 {p['batch_no']} 的 low_temp_hold_minutes 不是数字")
+        if (pack_limit is None) != (hold_low is None):
+            return _err(400, f"粉料 {p['batch_no']} 的包装温度上限 pack_temp_limit_c"
+                             " 与低温保持时长 low_temp_hold_minutes 须同时给出")
+        if pack_limit is not None and hold_low is not None and \
+                (pack_limit < 0 or hold_low < 0):
+            return _err(400, f"粉料 {p['batch_no']} 的包装冷却门限不能为负数")
         row = {"batch_no": p["batch_no"], "temp_min_c": float(p["temp_min_c"]),
-               "temp_max_c": float(p["temp_max_c"]), "hold_minutes": float(p["hold_minutes"])}
+               "temp_max_c": float(p["temp_max_c"]), "hold_minutes": float(p["hold_minutes"]),
+               "pack_temp_limit_c": pack_limit, "low_temp_hold_minutes": hold_low}
         db.execute(
-            "INSERT INTO powders (batch_no, temp_min_c, temp_max_c, hold_minutes)"
-            " VALUES (:batch_no, :temp_min_c, :temp_max_c, :hold_minutes)"
+            "INSERT INTO powders (batch_no, temp_min_c, temp_max_c, hold_minutes,"
+            " pack_temp_limit_c, low_temp_hold_minutes)"
+            " VALUES (:batch_no, :temp_min_c, :temp_max_c, :hold_minutes,"
+            " :pack_temp_limit_c, :low_temp_hold_minutes)"
             " ON CONFLICT(batch_no) DO UPDATE SET"
             " temp_min_c=excluded.temp_min_c, temp_max_c=excluded.temp_max_c,"
-            " hold_minutes=excluded.hold_minutes",
+            " hold_minutes=excluded.hold_minutes,"
+            " pack_temp_limit_c=excluded.pack_temp_limit_c,"
+            " low_temp_hold_minutes=excluded.low_temp_hold_minutes",
             row,
         )
         powder_req.append(row)
@@ -1657,7 +1856,8 @@ def issue(bid):
     # 签发时快照工件尺寸/重量与粉料固化窗口，此后主数据变更不影响本炉次
     rows = db.execute(
         "SELECT bi.workpiece_id, w.length_mm, w.width_mm, w.height_mm, w.weight_kg,"
-        " w.powder_batch, p.temp_min_c, p.temp_max_c, p.hold_minutes"
+        " w.powder_batch, p.temp_min_c, p.temp_max_c, p.hold_minutes,"
+        " p.pack_temp_limit_c, p.low_temp_hold_minutes"
         " FROM batch_items bi"
         " JOIN workpieces w ON w.id = bi.workpiece_id"
         " LEFT JOIN powders p ON p.batch_no = w.powder_batch"
@@ -1666,9 +1866,11 @@ def issue(bid):
         db.execute(
             "UPDATE batch_items SET snap_length_mm=?, snap_width_mm=?, snap_height_mm=?,"
             " snap_weight_kg=?, snap_powder_batch=?, snap_temp_min_c=?, snap_temp_max_c=?,"
-            " snap_hold_minutes=? WHERE batch_id=? AND workpiece_id=?",
+            " snap_hold_minutes=?, snap_pack_temp_limit_c=?,"
+            " snap_low_temp_hold_minutes=? WHERE batch_id=? AND workpiece_id=?",
             (r["length_mm"], r["width_mm"], r["height_mm"], r["weight_kg"],
              r["powder_batch"], r["temp_min_c"], r["temp_max_c"], r["hold_minutes"],
+             r["pack_temp_limit_c"], r["low_temp_hold_minutes"],
              bid, r["workpiece_id"]))
     # 签发时冻结探头配置（编号 + 校准偏移 + 校准证书版本快照），
     # 此后主数据变更与新证书版本均不影响本炉次
@@ -2003,6 +2205,243 @@ def add_readings(bid):
                                                 computed_at=now)})
 
 
+@bp.post("/batches/<int:bid>/workpieces/<wid>/cooling-readings")
+def add_cooling_readings(bid, wid):
+    """冷却测温写入：仅接收 COOLING（已合格离炉、冷却放行观察中）工件。
+
+    body: {"readings":[{ts, surface_temp_c}], "at"?: 基准时刻}
+    或单条 {ts, surface_temp_c}。
+    - 按 (炉次, 工件, 时刻) 幂等去重：同点同温度重复回传计入 duplicates；
+    - **乱序**（ts 早于已收录最新时标）与**同时刻不同温度**读数仍入库并
+      标记 kind（OUT_OF_ORDER / TS_CONFLICT），由冷却区间引擎截断当前连续
+      低温区间；同时刻不同温度另记一条 cooling_interruptions 人工中断；
+    - 测温时刻早于实际离炉时刻一律拒收（离炉前的表面温度不属冷却观测）。
+    接受后即时返回该件冷却进度。
+    """
+    db = get_db()
+    b = _fetch_batch(db, bid)
+    if b is None:
+        return _err(404, f"炉次 {bid} 不存在")
+    item = _cooling_item(db, bid, wid)
+    if item is None:
+        return _err(404, f"工件 {wid} 不在炉次 {bid} 中")
+    data = request.get_json(silent=True) or {}
+    entries = data.get("readings")
+    if entries is None and "ts" in data:
+        entries = [data]
+    if not entries:
+        return _err(400, "缺少 readings（或单条 ts/surface_temp_c）")
+
+    accepted = duplicates = conflicts = 0
+    rejected = []
+    stored = []   # 本次新收录（含乱序/冲突），用于按到达顺序即时反馈
+    unloaded_at = (datetime.fromisoformat(item["actual_unload_at"])
+                   if item["actual_unload_at"] else None)
+    for e in entries:
+        try:
+            ts = _parse_dt(e["ts"], "ts")
+            temp = float(e["surface_temp_c"])
+        except (KeyError, TypeError, ValueError) as ex:
+            rejected.append({"ts": e.get("ts"), "reason": f"测温记录无效: {ex}"})
+            continue
+        if item["release_kind"] is not None:
+            rejected.append({"ts": e.get("ts"),
+                             "reason": f"工件已于 {item['release_at']} "
+                                       f"{item['release_kind']} 放行，"
+                                       "放行后不再接收冷却测温"})
+            continue
+        if unloaded_at is None:
+            rejected.append({"ts": e.get("ts"),
+                             "reason": "工件尚未离炉，冷却测温自离炉时刻起接收"})
+            continue
+        if ts < unloaded_at:
+            rejected.append({"ts": e.get("ts"),
+                             "reason": f"测温时刻早于实际离炉时刻 "
+                                       f"{item['actual_unload_at']}，不予收录"})
+            continue
+        # 同点同温度（完全一致的 (时刻, 温度)）= 幂等重复，不重复入库；
+        # 同点不同温度（"同点重复"）= TS_CONFLICT，照常收录并截断区间
+        exact = db.execute(
+            "SELECT id FROM cooling_readings WHERE batch_id=? AND workpiece_id=?"
+            " AND ts=? AND ABS(surface_temp_c-?)<1e-9",
+            (bid, wid, ts.isoformat(), temp)).fetchone()
+        if exact is not None:
+            duplicates += 1
+            continue
+        prior = _cooling_readings(db, bid, wid) + stored
+        kind, prev_ts = cooling.admit(prior, ts, temp)
+        created = _now().isoformat()
+        db.execute(
+            "INSERT INTO cooling_readings (batch_id, workpiece_id, ts,"
+            " surface_temp_c, kind, created_at) VALUES (?,?,?,?,?,?)",
+            (bid, wid, ts.isoformat(), temp, kind, created))
+        stored.append((ts, temp, kind))
+        if kind == cooling.KIND_OK:
+            accepted += 1
+        else:
+            conflicts += 1
+            if kind == cooling.KIND_TS_CONFLICT:
+                prev_temp = db.execute(
+                    "SELECT surface_temp_c FROM cooling_readings"
+                    " WHERE batch_id=? AND workpiece_id=? AND ts=?"
+                    " ORDER BY id LIMIT 1",
+                    (bid, wid, ts.isoformat())).fetchone()
+                detail = (f"同时刻 {ts.isoformat(timespec='seconds')} 重复上报"
+                          f"不同表面温度：既有 "
+                          f"{prev_temp['surface_temp_c']:g}℃、新读数 {temp:g}℃，"
+                          "该时刻温度不可信，当前连续低温区间截断")
+            else:
+                detail = (f"读数乱序：{ts.isoformat(timespec='seconds')} 早于已收录最新"
+                          f"时刻 {prev_ts.isoformat(timespec='seconds') if prev_ts else '-'}，"
+                          "当前连续低温区间截断")
+            db.execute(
+                "INSERT INTO cooling_interruptions (batch_id, workpiece_id, code,"
+                " at_ts, detail, created_at) VALUES (?,?,?,?,?,?)",
+                (bid, wid, kind, ts.isoformat(), detail, created))
+    db.commit()
+    try:
+        as_of = _parse_dt(data["at"], "at") if data.get("at") else _now()
+    except ValueError as ex:
+        return _err(400, str(ex))
+    item = _cooling_item(db, bid, wid)
+    ev = _cooling_evaluate(db, bid, item, as_of)
+    return jsonify({"batch_id": bid, "workpiece_id": wid,
+                    "accepted": accepted, "duplicates": duplicates,
+                    "conflicts": conflicts, "rejected": rejected,
+                    "cooling": ev})
+
+
+@bp.get("/batches/<int:bid>/workpieces/<wid>/cooling")
+def cooling_progress(bid, wid):
+    """单工件冷却放行进度查询。
+
+    返回当前表面读数、当前连续低温区间有效保持分钟、按当前连续区间计算的
+    最早放行时刻、未满足项，以及完整区间中断追溯。可带 ?as_of= 历史复盘。
+    """
+    db = get_db()
+    b = _fetch_batch(db, bid)
+    if b is None:
+        return _err(404, f"炉次 {bid} 不存在")
+    item = _cooling_item(db, bid, wid)
+    if item is None:
+        return _err(404, f"工件 {wid} 不在炉次 {bid} 中")
+    try:
+        as_of = _parse_dt(request.args["as_of"], "as_of") \
+            if request.args.get("as_of") else _now()
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"batch_id": bid, "workpiece_id": wid,
+                    "state": _workpiece_state(db, wid),
+                    "cooling": _cooling_evaluate(db, bid, item, as_of)})
+
+
+@bp.get("/batches/<int:bid>/cooling")
+def batch_cooling(bid):
+    """炉次级冷却放行进度：逐件冷却状态、放行/紧急搬运统计。"""
+    db = get_db()
+    b = _fetch_batch(db, bid)
+    if b is None:
+        return _err(404, f"炉次 {bid} 不存在")
+    try:
+        as_of = _parse_dt(request.args["as_of"], "as_of") \
+            if request.args.get("as_of") else _now()
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"batch_id": bid, "state": b["state"],
+                    "cooling": _batch_cooling(db, b, as_of)})
+
+
+@bp.post("/batches/<int:bid>/workpieces/<wid>/release")
+def release_workpiece(bid, wid):
+    """冷却搬运放行。
+
+    body: {"at"?: 放行时刻, "emergency"?: true, "reason"?: 紧急理由}
+    - **正常放行**：工件须 COOLING 且截至 at 冷却门限已满足（连续低温区间
+      保持达到要求、读数未陈旧等）；未达门限一律 409，返回未满足项与最早
+      放行时刻，不留放行记录（后续测温后可再次请求）；
+    - **紧急搬运**：`emergency=true` 且必须填写 reason；不看门限，工件转
+      **REWORK_PENDING**（返工处置），落 EMERGENCY_RELEASE 标记与审计。
+    结案（炉次/工件）须引用一次有效放行记录（release_actions）。
+    """
+    db = get_db()
+    b = _fetch_batch(db, bid)
+    if b is None:
+        return _err(404, f"炉次 {bid} 不存在")
+    item = _cooling_item(db, bid, wid)
+    if item is None:
+        return _err(404, f"工件 {wid} 不在炉次 {bid} 中")
+    w = db.execute("SELECT status FROM workpieces WHERE id=?", (wid,)).fetchone()
+    data = request.get_json(silent=True) or {}
+    try:
+        at = _parse_dt(data["at"], "at") if data.get("at") else _now()
+    except ValueError as e:
+        return _err(400, str(e))
+    emergency = bool(data.get("emergency"))
+    reason = str(data.get("reason") or "").strip() or None
+
+    if item["release_kind"] is not None:
+        return _err(409, f"工件 {wid} 已于 {item['release_at']} "
+                         f"{item['release_kind']} 放行，不能重复放行",
+                    release_kind=item["release_kind"],
+                    release_at=item["release_at"])
+    if emergency and not reason:
+        return _err(400, "紧急搬运必须填写理由 reason")
+    # 冷却搬运放行自合格离炉后开始：仍在炉的工件不可搬运；
+    # 正常放行与紧急搬运都只适用于冷却放行观察中的 COOLING 件
+    if not item["actual_unload_at"]:
+        return _err(409, f"工件尚未离炉（状态 {w['status']}），"
+                         "冷却搬运放行自合格离炉后开始", state=w["status"])
+    if w["status"] != "COOLING":
+        action = "正常冷却放行" if not emergency else "紧急搬运"
+        return _err(409, f"工件状态为 {w['status']}，不能{action}"
+                         "（要求合格离炉后的 COOLING）", state=w["status"])
+
+    ev = _cooling_evaluate(db, bid, item, at)
+    if emergency:
+        # 紧急搬运：不看门限，转返工处置，保留人工决定与当时冷却快照
+        kind = RELEASE_EMERGENCY
+        wstatus = "REWORK_PENDING"
+        _add_flag(db, bid, wid, FLAG_EMERGENCY_RELEASE,
+                  f"冷却未达门限紧急搬运：{reason}"
+                  + (f"（未满足: {'、'.join(u['code'] for u in ev['unmet'])}）"
+                     if ev["unmet"] else ""))
+        held = ev["held_low_temp_minutes"]
+    else:
+        if not ev["releasable"]:
+            return _err(409, f"工件 {wid} 冷却放行门限未满足，拒绝搬运；"
+                             "紧急搬运请带 emergency=true 与 reason",
+                        state=w["status"], workpiece_id=wid,
+                        held_low_temp_minutes=ev["held_low_temp_minutes"],
+                        required_minutes=ev["low_temp_hold_minutes"],
+                        remaining_hold_minutes=ev["remaining_hold_minutes"],
+                        earliest_release_at=ev["earliest_release_at"],
+                        unmet=ev["unmet"], cooling=ev)
+        kind = RELEASE_NORMAL
+        wstatus = "DONE"
+        held = ev["held_low_temp_minutes"]
+
+    snap = json.dumps(ev, ensure_ascii=False)
+    cur = db.execute(
+        "INSERT INTO release_actions (batch_id, workpiece_id, kind, release_at,"
+        " reason, held_minutes, snapshot_json, created_at)"
+        " VALUES (?,?,?,?,?,?,?,?)",
+        (bid, wid, kind, at.isoformat(), reason, held, snap,
+         _now().isoformat()))
+    db.execute(
+        "UPDATE batch_items SET release_kind=?, release_at=?, release_reason=?,"
+        " release_snapshot_json=? WHERE batch_id=? AND workpiece_id=?",
+        (kind, at.isoformat(), reason, snap, bid, wid))
+    db.execute("UPDATE workpieces SET status=? WHERE id=?", (wstatus, wid))
+    db.commit()
+    return jsonify({"batch_id": bid, "workpiece_id": wid,
+                    "release_id": cur.lastrowid, "kind": kind,
+                    "release_at": at.isoformat(),
+                    "reason": reason if emergency else None,
+                    "workpiece_status": wstatus,
+                    "held_low_temp_minutes": held,
+                    "cooling_snapshot": ev})
+
+
 @bp.post("/batches/<int:bid>/workpieces/<wid>/unload")
 def unload_workpiece(bid, wid):
     """逐件出炉：按 at 判定单件是否达到安全出炉条件。
@@ -2160,17 +2599,40 @@ def close_batch(bid):
     if b["state"] not in TRANSITIONS["close"][0]:
         return _err(409, f"炉次状态为 {b['state']}，不能结案（要求 UNLOADED）",
                     state=b["state"])
-    blockers = db.execute(
-        "SELECT w.id, w.status FROM batch_items bi JOIN workpieces w ON w.id=bi.workpiece_id"
-        " WHERE bi.batch_id=? AND w.status NOT IN ('DONE','CLOSED')"
-        " AND NOT (w.status='PENDING' AND w.is_rework=1)", (bid,)).fetchall()
+    # 结案须引用一次有效放行：合格离炉件须冷却正常放行（release_actions
+    # NORMAL）后才 DONE；仍在 COOLING 的工件阻止结案；紧急搬运件已转返工，
+    # 按返工口径（PENDING+is_rework）不阻塞；每件 DONE 均须有放行记录
+    blockers = []
+    rows = db.execute(
+        "SELECT bi.workpiece_id, w.status, bi.release_kind, ra.id AS release_id"
+        " FROM batch_items bi JOIN workpieces w ON w.id=bi.workpiece_id"
+        " LEFT JOIN release_actions ra ON ra.batch_id=bi.batch_id"
+        "  AND ra.workpiece_id=bi.workpiece_id"
+        " WHERE bi.batch_id=?", (bid,)).fetchall()
+    for r in rows:
+        if r["status"] == "COOLING":
+            blockers.append({"workpiece_id": r["workpiece_id"],
+                             "status": "COOLING",
+                             "detail": "合格离炉件仍在冷却放行观察中，"
+                                       "须冷却测温满足门限并正常放行后才能结案"})
+        elif r["status"] == "REWORK_PENDING":
+            blockers.append({"workpiece_id": r["workpiece_id"],
+                             "status": "REWORK_PENDING",
+                             "detail": "待返工工件尚未回到待排产队列"})
+        elif r["status"] == "DONE" and r["release_id"] is None:
+            blockers.append({"workpiece_id": r["workpiece_id"],
+                             "status": "DONE",
+                             "detail": "工件已完成但缺少冷却放行记录，"
+                                       "结案须引用一次有效放行"})
     if blockers:
-        return _err(409, "存在未了结工件，不能结案",
-                    blockers=[{"workpiece_id": r["id"], "status": r["status"]}
-                              for r in blockers])
+        return _err(409, "存在未放行/未了结工件，不能结案", blockers=blockers)
     db.execute("UPDATE batches SET state='CLOSED' WHERE id=?", (bid,))
     db.commit()
-    return jsonify({"batch_id": bid, "state": "CLOSED"})
+    releases = db.execute(
+        "SELECT id, workpiece_id, kind, release_at FROM release_actions"
+        " WHERE batch_id=? ORDER BY id", (bid,)).fetchall()
+    return jsonify({"batch_id": bid, "state": "CLOSED",
+                    "releases": [dict(r) for r in releases]})
 
 
 # ---------------------------------------------------------------- 探头登记与处置
@@ -2558,10 +3020,33 @@ def workpiece_detail(wid):
     flags = db.execute(
         "SELECT batch_id, code, detail, created_at FROM flags WHERE workpiece_id=?"
         " ORDER BY id", (wid,)).fetchall()
+    # 冷却放行履历：逐炉次的冻结门限、表面读数、区间中断与人工搬运决定
+    cooling_records = []
+    for r in db.execute(
+            "SELECT bi.batch_id, bi.actual_unload_at, bi.snap_pack_temp_limit_c,"
+            " bi.snap_low_temp_hold_minutes, bi.release_kind, bi.release_at,"
+            " bi.release_reason, bi.release_snapshot_json, b.state AS batch_state"
+            " FROM batch_items bi JOIN batches b ON b.id=bi.batch_id"
+            " WHERE bi.workpiece_id=? AND bi.actual_unload_at IS NOT NULL"
+            " ORDER BY bi.batch_id", (wid,)).fetchall():
+        readings, interruptions = _cooling_reading_view(
+            db, r["batch_id"], wid)
+        cooling_records.append({
+            "batch_id": r["batch_id"], "batch_state": r["batch_state"],
+            "unloaded_at": r["actual_unload_at"],
+            "pack_temp_limit_c": r["snap_pack_temp_limit_c"],
+            "low_temp_hold_minutes": r["snap_low_temp_hold_minutes"],
+            "release": (None if r["release_kind"] is None else
+                        {"kind": r["release_kind"], "release_at": r["release_at"],
+                         "reason": r["release_reason"]}),
+            "release_snapshot": (json.loads(r["release_snapshot_json"])
+                                 if r["release_snapshot_json"] else None),
+            "readings": readings, "interruptions": interruptions})
     return jsonify({**{k: w[k] for k in w.keys()}, "is_rework": bool(w["is_rework"]),
                     "probes": _probes_of(db, wid),
                     "batches": [{**dict(r), "forced": bool(r["forced"])}
                                 for r in batches],
+                    "cooling_records": cooling_records,
                     "flags": [dict(r) for r in flags]})
 
 
@@ -2681,6 +3166,13 @@ def batch_card(bid):
             unload_txt = f"#{it['unload_sequence']} {it['actual_unload_at'][5:16]}"
             if it["final_verdict"] == "OK":
                 unload_txt += " 合格"
+                cv = it.get("cooling")
+                rel = cv.get("release") if cv else None
+                if rel:
+                    unload_txt += ("\n已放行 " if rel["kind"] == "NORMAL"
+                                   else "\n紧急搬运 ") + str(rel["release_at"])[5:16]
+                else:
+                    unload_txt += "\n冷却中"
             else:
                 unload_txt += " 不合格"
                 if it["forced"]:
@@ -2834,6 +3326,45 @@ def batch_card(bid):
         "</table>"
     ) if p.get("unload_order") else (
         "<h2>逐件离炉记录</h2><p class='small'>尚无工件离炉。</p>")
+    # 冷却放行：冻结门限、完整表面读数、区间中断与人工搬运决定
+    cool_rows = []
+    for it in p.get("items", []):
+        cv = it.get("cooling")
+        if not cv:
+            continue
+        snap = cv.get("snapshot") or {}
+        rel = cv.get("release")
+        if rel:
+            rel_txt = ("正常放行" if rel["kind"] == "NORMAL"
+                       else "紧急搬运（返工）")
+            rel_txt += f" {rel['release_at']}"
+            if rel.get("reason"):
+                rel_txt += f" 理由：{html.escape(rel['reason'])}"
+        else:
+            rel_txt = "冷却中"
+        breaks = "；".join(
+            f"{b.get('code')}@{b.get('to') or b.get('at_ts') or ''}"
+            for b in cv.get("interruptions", [])) or "-"
+        cool_rows.append(
+            "<tr>"
+            f"<td>{html.escape(it['workpiece_id'])}</td>"
+            f"<td>{cv['pack_temp_limit_c'] if cv['pack_temp_limit_c'] is not None else '-'}"
+            f" / {cv['low_temp_hold_minutes'] if cv['low_temp_hold_minutes'] is not None else '-'}</td>"
+            f"<td>{html.escape(str(snap.get('latest_reading_at') or '-'))}</td>"
+            f"<td>{snap.get('latest_surface_temp_c', '-')}</td>"
+            f"<td>{snap.get('held_low_temp_minutes', 0):g}</td>"
+            f"<td>{html.escape(str(snap.get('earliest_release_at') or '-'))}</td>"
+            f"<td>{html.escape(breaks)}</td>"
+            f"<td>{html.escape(rel_txt)}</td>"
+            "</tr>"
+        )
+    cool_block = (
+        "<h2>冷却放行（包装耐温门限 / 连续低温保持）</h2>"
+        "<table><tr><th>工件</th><th>耐温上限℃ / 保持 min</th>"
+        "<th>最新测温</th><th>表面℃</th><th>当前区间保持 min</th>"
+        "<th>最早放行</th><th>区间中断</th><th>人工决定</th></tr>"
+        f"{''.join(cool_rows)}</table>"
+    ) if cool_rows else ""
     # 吊具布置与载荷平衡：挂杆/吊点坐标、旋转、各点载荷、分区、横梁总载、
     # 左右力矩与搬入顺序（草稿为当前布置，签发后为冻结快照）
     rl = p.get("rack_layout")
@@ -2948,6 +3479,7 @@ p.small {{ font-size: 12px; margin: 4px 0; }}
 <h2>探头与判定序列</h2>
 {''.join(probe_blocks)}
 {unload_block}
+{cool_block}
 <div class="sign"><span>操作工：____________</span><span>检验员：____________</span>
 <span>日期：____________</span></div>
 </body></html>"""

@@ -110,9 +110,9 @@ class PieceUnloadTest(unittest.TestCase):
         # 炉次汇总只计在炉工件：W-1 已离炉，不进 items
         self.assertEqual([i["workpiece_id"] for i in body["progress"]["items"]],
                          ["W-2"])
-        # 工件状态 DONE，炉次仍 IN_OVEN
+        # 工件合格离炉进入冷却放行（COOLING），暂不计为完成；炉次仍 IN_OVEN
         w = self.c.get("/api/workpieces/W-1").get_json()
-        self.assertEqual(w["status"], "DONE")
+        self.assertEqual(w["status"], "COOLING")
         self.assertEqual(self.c.get(f"/api/batches/{bid}").get_json()["state"],
                          "IN_OVEN")
 
@@ -336,8 +336,9 @@ class PieceUnloadTest(unittest.TestCase):
         self.assertEqual(i2["final_verdict"], "NOT_OK")
         self.assertEqual([u["workpiece_id"] for u in d["unload_order"]],
                          ["W-1", "W-2"])
+        # 合格离炉件进入冷却放行（COOLING），正常放行后才 DONE
         self.assertEqual(self.c.get("/api/workpieces/W-1").get_json()["status"],
-                         "DONE")
+                         "COOLING")
 
     def test_batch_unload_when_all_pieces_gone(self):
         # 最后一件逐件离炉时炉次已自动转 UNLOADED：整炉接口越序 409，
