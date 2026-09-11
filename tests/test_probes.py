@@ -43,6 +43,26 @@ def _readings(wid, pid, temps):
              "metal_temp_c": t} for i, t in enumerate(temps)]
 
 
+def _bind_cal(client, wid, pid, offset):
+    """录入并绑定复现固定偏移的校准版本（点列斜率 1：校正值 = 原始值+offset）。
+
+    签发门禁要求每个登记探头绑定有效证书版本；点列 [(0,off),(500,500+off)]
+    覆盖测试温区与读数范围，插值结果与旧固定偏移一致，既有数值断言不变。
+    """
+    r = client.post(f"/api/workpieces/{wid}/probes/{pid}/calibrations", json={
+        "certificate_no": f"CERT-{wid}-{pid}",
+        "calibrated_at": "2026-09-01T00:00:00",
+        "valid_until": "2026-12-31T00:00:00",
+        "points": [{"indicated_c": 0, "reference_c": offset},
+                   {"indicated_c": 500, "reference_c": 500 + offset}]})
+    assert r.status_code == 201, r.get_data(as_text=True)
+    cal_id = r.get_json()["calibration"]["calibration_id"]
+    r = client.post(f"/api/workpieces/{wid}/probes",
+                    json={"probes": [{"probe_id": pid, "offset_c": offset,
+                                      "calibration_id": cal_id}]})
+    assert r.status_code == 201, r.get_data(as_text=True)
+
+
 class MultiProbeTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -73,6 +93,10 @@ class MultiProbeTest(unittest.TestCase):
     def _register(self, wid, probes):
         r = self.c.post(f"/api/workpieces/{wid}/probes", json={"probes": probes})
         self.assertEqual(r.status_code, 201, r.get_data(as_text=True))
+        # 签发门禁要求登记探头绑定证书版本：为每个探头补录并绑定
+        # 复现其固定偏移的校准版本（不改变校正数值）
+        for p in probes:
+            _bind_cal(self.c, wid, p["probe_id"], float(p.get("offset_c", 0)))
         return r.get_json()["probes"]
 
     def _post_readings(self, bid, readings):
@@ -295,6 +319,8 @@ class MultiProbeTest(unittest.TestCase):
         c.post("/api/workpieces/W-1/probes",
                json={"probes": [{"probe_id": "T1", "offset_c": 0},
                                 {"probe_id": "T2", "offset_c": 0}]})
+        _bind_cal(c, "W-1", "T1", 0.0)
+        _bind_cal(c, "W-1", "T2", 0.0)
         c.post(f"/api/batches/{bid}/issue")
         c.post(f"/api/batches/{bid}/load", json={"at": LOAD_AT})
         # T1 持续上报至 08:25；T2 仅在 08:00 上报一次
@@ -431,6 +457,8 @@ class MultiProbeTest(unittest.TestCase):
         c.post("/api/workpieces/W-1/probes",
                json={"probes": [{"probe_id": "T1", "offset_c": 0},
                                 {"probe_id": "T2", "offset_c": 0}]})
+        _bind_cal(c, "W-1", "T1", 0.0)
+        _bind_cal(c, "W-1", "T2", 0.0)
         c.post(f"/api/batches/{bid}/issue")
         c.post(f"/api/batches/{bid}/load", json={"at": LOAD_AT})
         c.post(f"/api/batches/{bid}/readings", json={"readings":
@@ -459,6 +487,8 @@ class MultiProbeTest(unittest.TestCase):
         c.post("/api/workpieces/W-1/probes",
                json={"probes": [{"probe_id": "T1", "offset_c": 0},
                                 {"probe_id": "T2", "offset_c": 0}]})
+        _bind_cal(c, "W-1", "T1", 0.0)
+        _bind_cal(c, "W-1", "T2", 0.0)
         c.post(f"/api/batches/{bid}/issue")
         c.post(f"/api/batches/{bid}/load", json={"at": LOAD_AT})
         c.post(f"/api/batches/{bid}/readings", json={"readings":

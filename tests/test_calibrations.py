@@ -283,10 +283,12 @@ class CalibrationTest(unittest.TestCase):
         self.assertEqual(p["calibration_id"], 999)
 
     def test_issue_check_lists_each_problem_probe(self):
-        # 同炉两工件：W-1 证书过期、W-2 覆盖不足，一次响应全部列出
-        bid = self._trial([_order("W-1"), _order("W-2")])
+        # 同炉三工件：W-1 证书过期、W-2 覆盖不足、W-3 未绑定，
+        # 一次响应全部列出
+        bid = self._trial([_order("W-1"), _order("W-2"), _order("W-3")])
         self._register("W-1", [{"probe_id": "T1", "offset_c": 0}])
         self._register("W-2", [{"probe_id": "T9", "offset_c": 0}])
+        self._register("W-3", [{"probe_id": "T5", "offset_c": 0}])
         c1 = self._add_cal("W-1", "T1", valid_until="2026-09-09T00:00:00")
         self._bind("W-1", "T1", c1["calibration_id"])
         c2 = self._add_cal("W-2", "T9", points=[(100, 100), (170, 170)])
@@ -296,14 +298,43 @@ class CalibrationTest(unittest.TestCase):
         got = {(p["workpiece_id"], p["probe_id"], p["code"])
                for p in r.get_json()["calibration_problems"]}
         self.assertEqual(got, {("W-1", "T1", "CALIBRATION_EXPIRED"),
-                               ("W-2", "T9", "CALIBRATION_COVERAGE")})
+                               ("W-2", "T9", "CALIBRATION_COVERAGE"),
+                               ("W-3", "T5", "CALIBRATION_MISSING")})
 
-    def test_unbound_probe_still_issues_with_fixed_offset(self):
-        # 未绑定证书版本的探头保持固定偏移模式，不受签发检查影响
+    def test_issue_blocked_when_calibration_id_null(self):
+        # 回归：登记探头未传 calibration_id（绑定为空）时签发必须阻断，
+        # 炉次不得变为 ISSUED，也不再回退固定偏移放行
         bid = self._trial([_order("W-1")])
         self._register("W-1", [{"probe_id": "T1", "offset_c": 1.0}])
         r = self.c.post(f"/api/batches/{bid}/issue")
+        self.assertEqual(r.status_code, 409, r.get_data(as_text=True))
+        body = r.get_json()
+        self.assertEqual(body["state"], "DRAFT")
+        problems = body["calibration_problems"]
+        self.assertEqual(len(problems), 1)
+        p = problems[0]
+        self.assertEqual(p["code"], "CALIBRATION_MISSING")
+        self.assertEqual((p["workpiece_id"], p["probe_id"]), ("W-1", "T1"))
+        self.assertIsNone(p["calibration_id"])
+        # 炉次状态不得变为 ISSUED
+        self.assertEqual(self.c.get(f"/api/batches/{bid}").get_json()["state"],
+                         "DRAFT")
+        # 显式解绑（calibration_id=null）同样阻断
+        cal = self._add_cal("W-1", "T1")
+        self._bind("W-1", "T1", cal["calibration_id"])
+        r = self.c.post("/api/workpieces/W-1/probes",
+                        json={"probes": [{"probe_id": "T1",
+                                          "calibration_id": None}]})
+        self.assertEqual(r.status_code, 201)
+        r = self.c.post(f"/api/batches/{bid}/issue")
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.get_json()["calibration_problems"][0]["code"],
+                         "CALIBRATION_MISSING")
+        # 重新绑定证书后签发成功
+        self._bind("W-1", "T1", cal["calibration_id"])
+        r = self.c.post(f"/api/batches/{bid}/issue")
         self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertEqual(r.get_json()["state"], "ISSUED")
 
     # ---------------------------------------------------------- 4. 插值与区间外
     def test_interpolation_by_frozen_points(self):

@@ -5,10 +5,10 @@
 有效探头校正温度的最低值；故障探头可在出炉前停用并重算该工件。
 
 校准证书版本化：探头可录入不可覆盖的多点校准版本（证书号、校准/到期
-时刻、示值—参考值点列），绑定探头时指定版本；签发按计划入炉时刻检查
-有效期与粉料温区覆盖并冻结点列快照；测温按冻结点列线性插值，
-区间外读数不计入保温累计并产生 CALIBRATION_RANGE 告警；
-新证书只供未签发炉次使用。
+时刻、示值—参考值点列），绑定探头时指定版本；登记探头必须绑定版本
+才能签发——签发按计划入炉时刻检查绑定、有效期与粉料温区覆盖并冻结
+点列快照；测温按冻结点列线性插值，区间外读数不计入保温累计并产生
+CALIBRATION_RANGE 告警；新证书只供未签发炉次使用。
 """
 from __future__ import annotations
 
@@ -994,11 +994,12 @@ def trial():
 # ---------------------------------------------------------------- 状态机动作
 
 def _calibration_problems(db, b):
-    """签发前校准检查：逐工件逐探头核对证书有效期与粉料温区覆盖。
+    """签发前校准检查：逐工件逐探头核对证书绑定、有效期与粉料温区覆盖。
 
-    只检查绑定了校准证书版本的探头（未绑定的探头按固定偏移模式放行）。
-    按计划入炉时刻判定：证书缺失 / 尚未生效 / 已过期 / 点列区间未覆盖
-    该工件粉料固化窗口，均列出并阻止签发。
+    炉内工件登记的每个探头都必须绑定校准证书版本（不再回退固定偏移）：
+    未绑定 / 版本缺失 / 尚未生效 / 已过期 / 点列区间未覆盖该工件粉料
+    固化窗口，均按计划入炉时刻判定，列出并阻止签发。
+    未登记探头的工件（隐式通道）不参与本检查。
     """
     planned_load = datetime.fromisoformat(b["planned_load_at"])
     items = db.execute(
@@ -1014,12 +1015,18 @@ def _calibration_problems(db, b):
             " c.calibrated_at, c.valid_until, c.points_json"
             " FROM probes p"
             " LEFT JOIN probe_calibrations c ON c.id = p.calibration_id"
-            " WHERE p.workpiece_id=? AND p.calibration_id IS NOT NULL"
+            " WHERE p.workpiece_id=?"
             " ORDER BY p.probe_id", (wid,)).fetchall()
         for pr in bound:
             base = {"workpiece_id": wid, "probe_id": pr["probe_id"],
                     "calibration_id": pr["calibration_id"],
                     "planned_load_at": b["planned_load_at"]}
+            if pr["calibration_id"] is None:
+                problems.append({
+                    **base, "code": CAL_MISSING,
+                    "detail": f"探头 {pr['probe_id']} 未绑定校准版本"
+                              "（登记探头时须指定 calibration_id）"})
+                continue
             if pr["certificate_no"] is None:
                 problems.append({
                     **base, "code": CAL_MISSING,
@@ -1065,8 +1072,9 @@ def _calibration_problems(db, b):
 def issue(bid):
     """签发：DRAFT -> ISSUED，签发后炉次冻结，不再参与重排。
 
-    签发前校验绑定探头的校准证书：按计划入炉时刻检查有效期与粉料温区
-    覆盖，缺失/未生效/过期/覆盖不足时列出相关工件和探头并阻止签发。
+    签发前校验炉内工件登记的每个探头都已绑定校准证书版本，并按计划
+    入炉时刻检查有效期与粉料温区覆盖；未绑定/缺失/未生效/过期/覆盖
+    不足时列出相关工件和探头并阻止签发（不再回退固定偏移放行）。
     """
     db = get_db()
     b = _fetch_batch(db, bid)
@@ -1074,10 +1082,10 @@ def issue(bid):
         return _err(404, f"炉次 {bid} 不存在")
     if b["state"] not in TRANSITIONS["issue"][0]:
         return _err(409, f"炉次状态为 {b['state']}，不能签发（要求 DRAFT）", state=b["state"])
-    # 校准证书检查：绑定证书版本的探头须在计划入炉时刻有效且覆盖粉料温区
+    # 校准证书检查：登记探头须绑定证书版本，且在计划入炉时刻有效、覆盖粉料温区
     problems = _calibration_problems(db, b)
     if problems:
-        return _err(409, "探头校准证书未通过签发检查（缺失/未生效/过期/"
+        return _err(409, "探头校准证书未通过签发检查（未绑定/缺失/未生效/过期/"
                          "温区覆盖不足），阻止签发",
                     state=b["state"], calibration_problems=problems)
     # 签发时快照工件尺寸/重量与粉料固化窗口，此后主数据变更不影响本炉次
@@ -1416,6 +1424,7 @@ def register_probes(wid):
 
     签发时随炉次冻结快照（含证书版本与点列），此后变更只影响新炉次。
     请求不带 calibration_id 键时保留既有绑定；显式传 null 解除绑定。
+    注意：登记探头未绑定证书版本（calibration_id 为 NULL）时炉次不能签发。
     """
     db = get_db()
     w = db.execute("SELECT id FROM workpieces WHERE id=?", (wid,)).fetchone()
