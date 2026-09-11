@@ -3,6 +3,12 @@
 多探头：工件可登记多个金属探头及校准偏移，签发时冻结配置；
 测温按 (炉次, 工件, 探头, 时刻) 幂等去重；判定序列取每个采样时刻
 有效探头校正温度的最低值；故障探头可在出炉前停用并重算该工件。
+
+校准证书版本化：探头可录入不可覆盖的多点校准版本（证书号、校准/到期
+时刻、示值—参考值点列），绑定探头时指定版本；签发按计划入炉时刻检查
+有效期与粉料温区覆盖并冻结点列快照；测温按冻结点列线性插值，
+区间外读数不计入保温累计并产生 CALIBRATION_RANGE 告警；
+新证书只供未签发炉次使用。
 """
 from __future__ import annotations
 
@@ -34,6 +40,12 @@ FLAG_PROBE_DIVERGENCE = "PROBE_DIVERGENCE"  # 探头温差：有效探头间温�
 FLAG_INSUFFICIENT_PROBES = "INSUFFICIENT_PROBES"  # 有效探头数不足，不得判定合格
 FLAG_UNISSUED_UNLOAD = "UNISSUED_UNLOAD"    # 未签发出炉
 FLAG_INCOMPAT = "INCOMPAT_CONFLICT"         # 禁配冲突
+
+# 校准证书签发检查代码（命中即阻止签发）
+CAL_MISSING = "CALIBRATION_MISSING"              # 绑定的校准版本缺失
+CAL_NOT_YET_VALID = "CALIBRATION_NOT_YET_VALID"  # 计划入炉时刻证书尚未生效
+CAL_EXPIRED = "CALIBRATION_EXPIRED"              # 计划入炉时刻证书已过期
+CAL_COVERAGE = "CALIBRATION_COVERAGE"            # 点列区间未覆盖粉料温区
 
 # 停机窗类型（清炉/校准/检修整段占用烘炉）
 BLACKOUT_KINDS = {"CLEANING": "清炉", "CALIBRATION": "校准", "MAINTENANCE": "检修"}
@@ -74,24 +86,80 @@ def _add_flag(db, batch_id, workpiece_id, code, detail):
     )
 
 
+def _calibration_view(calibration_id, version, certificate_no, calibrated_at,
+                      valid_until, points_json, planned_load_at=None):
+    """证书版本视图：证书号/版本、插值区间与到期状态（相对计划入炉时刻）。
+
+    绑定关系存在但版本记录缺失（certificate_no 为 NULL）时返回 None，
+    由签发检查以 CALIBRATION_MISSING 拦截。
+    """
+    if calibration_id is None or certificate_no is None:
+        return None
+    points = json.loads(points_json) if points_json else []
+    pairs = [[p["indicated_c"], p["reference_c"]] for p in points]
+    expired = False
+    if planned_load_at and valid_until:
+        expired = (datetime.fromisoformat(planned_load_at)
+                   > datetime.fromisoformat(valid_until))
+    return {
+        "calibration_id": calibration_id,
+        "version": version,
+        "certificate_no": certificate_no,
+        "calibrated_at": calibrated_at,
+        "valid_until": valid_until,
+        "range_min_c": pairs[0][0] if pairs else None,
+        "range_max_c": pairs[-1][0] if pairs else None,
+        "points": pairs,
+        "expired": expired,
+    }
+
+
 def _probe_cfg_for_item(db, batch_id, workpiece_id, frozen):
     """工件在该炉次中的探头配置。
 
     frozen=True（已签发及以后）取签发时冻结的快照（即使为空也不再回退主数据）；
     frozen=False（草稿/被取代）取当前登记的探头主数据。
+    绑定校准证书版本的探头附带证书视图（证书号/版本/插值区间/到期状态），
+    到期状态相对该炉次计划入炉时刻判定（签发检查口径）。
     """
+    planned = db.execute("SELECT planned_load_at FROM batches WHERE id=?",
+                         (batch_id,)).fetchone()
+    planned_load_at = planned["planned_load_at"] if planned else None
     if frozen:
         rows = db.execute(
-            "SELECT probe_id, offset_c, status, disabled_reason, disabled_at"
+            "SELECT probe_id, offset_c, status, disabled_reason, disabled_at,"
+            " calibration_id, version, certificate_no, calibrated_at, valid_until,"
+            " points_json"
             " FROM batch_item_probes WHERE batch_id=? AND workpiece_id=?"
             " ORDER BY probe_id", (batch_id, workpiece_id)).fetchall()
     else:
         rows = db.execute(
-            "SELECT probe_id, offset_c, 'ACTIVE' AS status,"
-            " NULL AS disabled_reason, NULL AS disabled_at"
-            " FROM probes WHERE workpiece_id=? ORDER BY probe_id",
+            "SELECT p.probe_id, p.offset_c, 'ACTIVE' AS status,"
+            " NULL AS disabled_reason, NULL AS disabled_at,"
+            " p.calibration_id, c.version, c.certificate_no, c.calibrated_at,"
+            " c.valid_until, c.points_json"
+            " FROM probes p"
+            " LEFT JOIN probe_calibrations c ON c.id = p.calibration_id"
+            " WHERE p.workpiece_id=? ORDER BY p.probe_id",
             (workpiece_id,)).fetchall()
-    return {r["probe_id"]: dict(r) for r in rows}
+    cfg = {}
+    for r in rows:
+        d = dict(r)
+        points_json = d.pop("points_json")
+        d["calibration"] = _calibration_view(
+            d.pop("calibration_id"), d.pop("version"), d.pop("certificate_no"),
+            d.pop("calibrated_at"), d.pop("valid_until"), points_json,
+            planned_load_at)
+        cfg[d["probe_id"]] = d
+    return cfg
+
+
+def _analyze_cfg(cfg):
+    """probes.analyze / progress.project_item 的探头配置视图（含插值点列）。"""
+    return {pid: {"offset_c": c["offset_c"], "status": c["status"],
+                  "points": (c.get("calibration") or {}).get("points"),
+                  "calibration": c.get("calibration")}
+            for pid, c in cfg.items()}
 
 
 def _cure_for_item(db, b, workpiece_id, as_of=None):
@@ -132,8 +200,7 @@ def _cure_for_item(db, b, workpiece_id, as_of=None):
            for r in rows]
     result = probes.analyze(
         pts,
-        {pid: {"offset_c": c["offset_c"], "status": c["status"]}
-         for pid, c in cfg.items()},
+        _analyze_cfg(cfg),
         row["temp_min_c"],
         row["temp_max_c"],
         row["hold_minutes"],
@@ -359,8 +426,7 @@ def _item_project(db, b, wid, as_of):
         frozen=b["state"] not in ("DRAFT", "SUPERSEDED"))
     return progress.project_item(
         pts,
-        {pid: {"offset_c": c["offset_c"], "status": c["status"]}
-         for pid, c in cfg.items()},
+        _analyze_cfg(cfg),
         wmin, wmax, hold, as_of, current_app.config["PROBE_GAP_MINUTES"],
         current_app.config["PROBE_DIVERGENCE_C"],
         current_app.config["STUCK_PROBE_MIN_CONSECUTIVE"],
@@ -927,15 +993,93 @@ def trial():
 
 # ---------------------------------------------------------------- 状态机动作
 
+def _calibration_problems(db, b):
+    """签发前校准检查：逐工件逐探头核对证书有效期与粉料温区覆盖。
+
+    只检查绑定了校准证书版本的探头（未绑定的探头按固定偏移模式放行）。
+    按计划入炉时刻判定：证书缺失 / 尚未生效 / 已过期 / 点列区间未覆盖
+    该工件粉料固化窗口，均列出并阻止签发。
+    """
+    planned_load = datetime.fromisoformat(b["planned_load_at"])
+    items = db.execute(
+        "SELECT bi.workpiece_id, p.temp_min_c, p.temp_max_c"
+        " FROM batch_items bi JOIN workpieces w ON w.id = bi.workpiece_id"
+        " LEFT JOIN powders p ON p.batch_no = w.powder_batch"
+        " WHERE bi.batch_id=? ORDER BY bi.hanger_slot", (b["id"],)).fetchall()
+    problems = []
+    for it in items:
+        wid = it["workpiece_id"]
+        bound = db.execute(
+            "SELECT p.probe_id, p.calibration_id, c.version, c.certificate_no,"
+            " c.calibrated_at, c.valid_until, c.points_json"
+            " FROM probes p"
+            " LEFT JOIN probe_calibrations c ON c.id = p.calibration_id"
+            " WHERE p.workpiece_id=? AND p.calibration_id IS NOT NULL"
+            " ORDER BY p.probe_id", (wid,)).fetchall()
+        for pr in bound:
+            base = {"workpiece_id": wid, "probe_id": pr["probe_id"],
+                    "calibration_id": pr["calibration_id"],
+                    "planned_load_at": b["planned_load_at"]}
+            if pr["certificate_no"] is None:
+                problems.append({
+                    **base, "code": CAL_MISSING,
+                    "detail": f"探头 {pr['probe_id']} 绑定的校准版本"
+                              f" {pr['calibration_id']} 不存在"})
+                continue
+            base.update({"certificate_no": pr["certificate_no"],
+                         "version": pr["version"],
+                         "calibrated_at": pr["calibrated_at"],
+                         "valid_until": pr["valid_until"]})
+            if planned_load < datetime.fromisoformat(pr["calibrated_at"]):
+                problems.append({
+                    **base, "code": CAL_NOT_YET_VALID,
+                    "detail": f"证书 {pr['certificate_no']} 于"
+                              f" {pr['calibrated_at']} 才生效，"
+                              f"计划入炉 {b['planned_load_at']} 尚未生效"})
+                continue
+            if planned_load > datetime.fromisoformat(pr["valid_until"]):
+                problems.append({
+                    **base, "code": CAL_EXPIRED,
+                    "detail": f"证书 {pr['certificate_no']} 已于"
+                              f" {pr['valid_until']} 到期，"
+                              f"计划入炉 {b['planned_load_at']} 已过期"})
+                continue
+            # 粉料温区覆盖：点列示值区间须覆盖该工件粉料固化窗口
+            if it["temp_min_c"] is None or it["temp_max_c"] is None:
+                continue  # 粉料未登记时无窗口可查（该工件本不应入炉次）
+            pts = json.loads(pr["points_json"])
+            lo, hi = pts[0]["indicated_c"], pts[-1]["indicated_c"]
+            if lo > it["temp_min_c"] or hi < it["temp_max_c"]:
+                problems.append({
+                    **base, "code": CAL_COVERAGE,
+                    "range_min_c": lo, "range_max_c": hi,
+                    "window_min_c": it["temp_min_c"],
+                    "window_max_c": it["temp_max_c"],
+                    "detail": f"证书 {pr['certificate_no']} 点列区间"
+                              f" {lo:g}–{hi:g}℃ 未覆盖粉料温区"
+                              f" {it['temp_min_c']:g}–{it['temp_max_c']:g}℃"})
+    return problems
+
+
 @bp.post("/batches/<int:bid>/issue")
 def issue(bid):
-    """签发：DRAFT -> ISSUED，签发后炉次冻结，不再参与重排。"""
+    """签发：DRAFT -> ISSUED，签发后炉次冻结，不再参与重排。
+
+    签发前校验绑定探头的校准证书：按计划入炉时刻检查有效期与粉料温区
+    覆盖，缺失/未生效/过期/覆盖不足时列出相关工件和探头并阻止签发。
+    """
     db = get_db()
     b = _fetch_batch(db, bid)
     if b is None:
         return _err(404, f"炉次 {bid} 不存在")
     if b["state"] not in TRANSITIONS["issue"][0]:
         return _err(409, f"炉次状态为 {b['state']}，不能签发（要求 DRAFT）", state=b["state"])
+    # 校准证书检查：绑定证书版本的探头须在计划入炉时刻有效且覆盖粉料温区
+    problems = _calibration_problems(db, b)
+    if problems:
+        return _err(409, "探头校准证书未通过签发检查（缺失/未生效/过期/"
+                         "温区覆盖不足），阻止签发",
+                    state=b["state"], calibration_problems=problems)
     # 签发时快照工件尺寸/重量与粉料固化窗口，此后主数据变更不影响本炉次
     rows = db.execute(
         "SELECT bi.workpiece_id, w.length_mm, w.width_mm, w.height_mm, w.weight_kg,"
@@ -952,15 +1096,25 @@ def issue(bid):
             (r["length_mm"], r["width_mm"], r["height_mm"], r["weight_kg"],
              r["powder_batch"], r["temp_min_c"], r["temp_max_c"], r["hold_minutes"],
              bid, r["workpiece_id"]))
-    # 签发时冻结探头配置（编号 + 校准偏移），此后主数据变更不影响本炉次
+    # 签发时冻结探头配置（编号 + 校准偏移 + 校准证书版本快照），
+    # 此后主数据变更与新证书版本均不影响本炉次
     for r in rows:
         for pr in db.execute(
-                "SELECT probe_id, offset_c FROM probes WHERE workpiece_id=?"
-                " ORDER BY probe_id", (r["workpiece_id"],)).fetchall():
+                "SELECT p.probe_id, p.offset_c, p.calibration_id,"
+                " c.version, c.certificate_no, c.calibrated_at, c.valid_until,"
+                " c.points_json"
+                " FROM probes p"
+                " LEFT JOIN probe_calibrations c ON c.id = p.calibration_id"
+                " WHERE p.workpiece_id=? ORDER BY p.probe_id",
+                (r["workpiece_id"],)).fetchall():
             db.execute(
                 "INSERT OR IGNORE INTO batch_item_probes"
-                " (batch_id, workpiece_id, probe_id, offset_c) VALUES (?,?,?,?)",
-                (bid, r["workpiece_id"], pr["probe_id"], pr["offset_c"]))
+                " (batch_id, workpiece_id, probe_id, offset_c, calibration_id,"
+                " version, certificate_no, calibrated_at, valid_until, points_json)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (bid, r["workpiece_id"], pr["probe_id"], pr["offset_c"],
+                 pr["calibration_id"], pr["version"], pr["certificate_no"],
+                 pr["calibrated_at"], pr["valid_until"], pr["points_json"]))
     db.execute("UPDATE batches SET state='ISSUED' WHERE id=?", (bid,))
     db.commit()
     return jsonify({"batch_id": bid, "state": "ISSUED"})
@@ -1258,7 +1412,11 @@ def close_batch(bid):
 
 @bp.post("/workpieces/<wid>/probes")
 def register_probes(wid):
-    """登记/更新工件探头及校准偏移；签发时随炉次冻结快照，此后变更只影响新炉次。"""
+    """登记/更新工件探头及校准偏移，可指定校准证书版本（calibration_id）。
+
+    签发时随炉次冻结快照（含证书版本与点列），此后变更只影响新炉次。
+    请求不带 calibration_id 键时保留既有绑定；显式传 null 解除绑定。
+    """
     db = get_db()
     w = db.execute("SELECT id FROM workpieces WHERE id=?", (wid,)).fetchone()
     if w is None:
@@ -1281,12 +1439,35 @@ def register_probes(wid):
             offset = float(e.get("offset_c", 0))
         except (TypeError, ValueError):
             return _err(400, f"探头 {pid} 的 offset_c 不是数字: {e.get('offset_c')!r}")
-        db.execute(
-            "INSERT INTO probes (workpiece_id, probe_id, offset_c, created_at)"
-            " VALUES (?,?,?,?)"
-            " ON CONFLICT(workpiece_id, probe_id) DO UPDATE SET"
-            " offset_c=excluded.offset_c",
-            (wid, pid, offset, _now().isoformat()))
+        if "calibration_id" in e:
+            # 绑定指定校准版本（须属于该探头）；显式 null 解除绑定
+            cal_id = e.get("calibration_id")
+            if cal_id is not None:
+                try:
+                    cal_id = int(cal_id)
+                except (TypeError, ValueError):
+                    return _err(400, f"探头 {pid} 的 calibration_id 不是整数:"
+                                     f" {e.get('calibration_id')!r}")
+                cal = db.execute(
+                    "SELECT id FROM probe_calibrations"
+                    " WHERE id=? AND workpiece_id=? AND probe_id=?",
+                    (cal_id, wid, pid)).fetchone()
+                if cal is None:
+                    return _err(400, f"校准版本 {cal_id} 不存在或不属于探头 {pid}")
+            db.execute(
+                "INSERT INTO probes (workpiece_id, probe_id, offset_c,"
+                " calibration_id, created_at) VALUES (?,?,?,?,?)"
+                " ON CONFLICT(workpiece_id, probe_id) DO UPDATE SET"
+                " offset_c=excluded.offset_c,"
+                " calibration_id=excluded.calibration_id",
+                (wid, pid, offset, cal_id, _now().isoformat()))
+        else:
+            db.execute(
+                "INSERT INTO probes (workpiece_id, probe_id, offset_c, created_at)"
+                " VALUES (?,?,?,?)"
+                " ON CONFLICT(workpiece_id, probe_id) DO UPDATE SET"
+                " offset_c=excluded.offset_c",
+                (wid, pid, offset, _now().isoformat()))
     db.commit()
     return jsonify({"workpiece_id": wid, "probes": _probes_of(db, wid)}), 201
 
@@ -1302,9 +1483,135 @@ def list_probes(wid):
 
 
 def _probes_of(db, wid):
-    return [dict(r) for r in db.execute(
-        "SELECT probe_id, offset_c, created_at FROM probes"
-        " WHERE workpiece_id=? ORDER BY probe_id", (wid,)).fetchall()]
+    """工件探头主数据：校准偏移与绑定的证书版本摘要。"""
+    rows = db.execute(
+        "SELECT p.probe_id, p.offset_c, p.calibration_id, p.created_at,"
+        " c.version, c.certificate_no, c.calibrated_at, c.valid_until"
+        " FROM probes p"
+        " LEFT JOIN probe_calibrations c ON c.id = p.calibration_id"
+        " WHERE p.workpiece_id=? ORDER BY p.probe_id", (wid,)).fetchall()
+    out = []
+    for r in rows:
+        d = {"probe_id": r["probe_id"], "offset_c": r["offset_c"],
+             "calibration_id": r["calibration_id"], "created_at": r["created_at"]}
+        if r["calibration_id"] is not None and r["certificate_no"] is not None:
+            d["calibration"] = {
+                "version": r["version"],
+                "certificate_no": r["certificate_no"],
+                "calibrated_at": r["calibrated_at"],
+                "valid_until": r["valid_until"],
+            }
+        out.append(d)
+    return out
+
+
+# ---------------------------------------------------------------- 探头校准证书
+
+def _parse_calibration_points(raw):
+    """校验示值—参考值点列：至少两点、数值合法、示值严格递增（ValueError）。"""
+    if not isinstance(raw, list) or len(raw) < 2:
+        raise ValueError("校准点列至少需要两个点（示值 indicated_c — 参考值"
+                         " reference_c）")
+    points = []
+    for p in raw:
+        if not isinstance(p, dict):
+            raise ValueError(f"校准点须为对象: {p!r}")
+        try:
+            indicated = float(p["indicated_c"])
+            reference = float(p["reference_c"])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError(f"校准点须含数值 indicated_c/reference_c: {p!r}")
+        points.append({"indicated_c": indicated, "reference_c": reference})
+    for a, b in zip(points, points[1:]):
+        if b["indicated_c"] <= a["indicated_c"]:
+            raise ValueError(f"校准点列示值不递增: {a['indicated_c']:g} 之后出现"
+                             f" {b['indicated_c']:g}")
+    return points
+
+
+def _calibration_json(r):
+    """校准版本行的 API 视图（含点列与插值区间）。"""
+    points = json.loads(r["points_json"])
+    return {
+        "calibration_id": r["id"],
+        "version": r["version"],
+        "certificate_no": r["certificate_no"],
+        "calibrated_at": r["calibrated_at"],
+        "valid_until": r["valid_until"],
+        "range_min_c": points[0]["indicated_c"],
+        "range_max_c": points[-1]["indicated_c"],
+        "points": points,
+        "created_at": r["created_at"],
+    }
+
+
+@bp.post("/workpieces/<wid>/probes/<pid>/calibrations")
+def add_calibration(wid, pid):
+    """录入探头校准证书版本（不可覆盖的多点版本）。
+
+    每次录入追加一个新版本（version 自增），已录入版本不可修改/删除；
+    新证书只供未签发炉次使用（已签发炉次用签发时冻结的快照）。
+    少于两点、校准/到期时刻倒置或点列示值不递增时拒绝。
+    """
+    db = get_db()
+    w = db.execute("SELECT id FROM workpieces WHERE id=?", (wid,)).fetchone()
+    if w is None:
+        return _err(404, f"工件 {wid} 不存在")
+    pr = db.execute(
+        "SELECT id FROM probes WHERE workpiece_id=? AND probe_id=?",
+        (wid, pid)).fetchone()
+    if pr is None:
+        return _err(404, f"探头 {pid} 未登记在工件 {wid} 上")
+    data = request.get_json(silent=True) or {}
+    try:
+        cert = str(data.get("certificate_no") or "").strip()
+        if not cert:
+            raise ValueError("certificate_no 不能为空")
+        calibrated_at = _parse_dt(data["calibrated_at"], "calibrated_at")
+        valid_until = _parse_dt(data["valid_until"], "valid_until")
+        if valid_until <= calibrated_at:
+            raise ValueError(
+                f"校准有效期倒置: 校准时刻 {calibrated_at.isoformat()} 不早于"
+                f"到期时刻 {valid_until.isoformat()}")
+        points = _parse_calibration_points(data.get("points"))
+    except KeyError as e:
+        return _err(400, f"缺少字段: {e.args[0]}")
+    except ValueError as e:
+        return _err(400, str(e))
+    version = db.execute(
+        "SELECT COALESCE(MAX(version), 0) + 1 AS v FROM probe_calibrations"
+        " WHERE workpiece_id=? AND probe_id=?", (wid, pid)).fetchone()["v"]
+    cur = db.execute(
+        "INSERT INTO probe_calibrations (workpiece_id, probe_id, version,"
+        " certificate_no, calibrated_at, valid_until, points_json, created_at)"
+        " VALUES (?,?,?,?,?,?,?,?)",
+        (wid, pid, version, cert, calibrated_at.isoformat(),
+         valid_until.isoformat(), json.dumps(points, ensure_ascii=False),
+         _now().isoformat()))
+    db.commit()
+    row = db.execute("SELECT * FROM probe_calibrations WHERE id=?",
+                     (cur.lastrowid,)).fetchone()
+    return jsonify({"workpiece_id": wid, "probe_id": pid,
+                    "calibration": _calibration_json(row)}), 201
+
+
+@bp.get("/workpieces/<wid>/probes/<pid>/calibrations")
+def list_calibrations(wid, pid):
+    """探头校准证书历史版本（按版本序号升序，含点列与插值区间）。"""
+    db = get_db()
+    w = db.execute("SELECT id FROM workpieces WHERE id=?", (wid,)).fetchone()
+    if w is None:
+        return _err(404, f"工件 {wid} 不存在")
+    pr = db.execute(
+        "SELECT id FROM probes WHERE workpiece_id=? AND probe_id=?",
+        (wid, pid)).fetchone()
+    if pr is None:
+        return _err(404, f"探头 {pid} 未登记在工件 {wid} 上")
+    rows = db.execute(
+        "SELECT * FROM probe_calibrations WHERE workpiece_id=? AND probe_id=?"
+        " ORDER BY version", (wid, pid)).fetchall()
+    return jsonify({"workpiece_id": wid, "probe_id": pid,
+                    "calibrations": [_calibration_json(r) for r in rows]})
 
 
 @bp.post("/batches/<int:bid>/workpieces/<wid>/probes/<pid>/disable")
@@ -1613,12 +1920,28 @@ def batch_card(bid):
             status = pr["status"]
             if pr.get("disabled_reason"):
                 status += f"（{html.escape(pr['disabled_reason'])}）"
+            cal = pr.get("calibration")
+            if cal:
+                cert_txt = (f"{html.escape(str(cal['certificate_no']))}"
+                            f"（v{cal['version']}）")
+                range_txt = f"{cal['range_min_c']:g}–{cal['range_max_c']:g}"
+                expiry_txt = f"{cal['valid_until']}"
+                expiry_txt += "（计划入炉时已过期）" if cal.get("expired") \
+                    else "（计划入炉时有效）"
+            else:
+                cert_txt = range_txt = expiry_txt = "-"
+            readings_txt = str(pr["reading_count"])
+            if pr.get("out_of_range_count"):
+                readings_txt += f"（超区间 {pr['out_of_range_count']} 点未计入）"
             probe_rows.append(
                 "<tr>"
                 f"<td>{html.escape(str(pr['probe_id'] or '（隐式通道）'))}</td>"
                 f"<td>{pr['offset_c']:+.2f}</td>"
+                f"<td>{cert_txt}</td>"
+                f"<td>{range_txt}</td>"
+                f"<td>{html.escape(expiry_txt)}</td>"
                 f"<td>{html.escape(status)}</td>"
-                f"<td>{pr['reading_count']}</td>"
+                f"<td>{readings_txt}</td>"
                 f"<td>{anomalies}</td>"
                 "</tr>"
             )
@@ -1628,16 +1951,22 @@ def batch_card(bid):
             f"{html.escape(str(g['probe_id'] or '（隐式通道）'))} "
             f"{g['from']}–{g['to']}（{g['minutes']} 分钟）"
             for g in c["probe_gaps"]) or "-"
+        oor = "；".join(
+            f"{html.escape(str(o['probe_id']))} {o['ts']} 示值 {o['raw_c']:g}℃"
+            f"（区间 {o['range_min_c']:g}–{o['range_max_c']:g}℃）"
+            for o in c.get("calibration_range", [])) or "-"
         series = "，".join(f"{pt['ts'][11:16]}={pt['temp_c']:.1f}"
                            for pt in c["judgment_series"]) or "-"
         probe_blocks.append(
             f"<h3>工件 {html.escape(it['workpiece_id'])}"
             f"（有效探头 {c['valid_probe_count']} / 要求 {c['min_valid_probes']}）</h3>"
-            "<table><tr><th>探头</th><th>校准偏移 ℃</th><th>状态</th>"
+            "<table><tr><th>探头</th><th>校准偏移 ℃</th><th>证书版本</th>"
+            "<th>插值区间 ℃</th><th>到期状态</th><th>状态</th>"
             "<th>读数</th><th>异常区间</th></tr>"
             f"{''.join(probe_rows)}</table>"
             f"<p class='small'>探头温差异常：{divergences}</p>"
             f"<p class='small'>缺报区间：{gaps}</p>"
+            f"<p class='small'>超校准区间读数（未计入保温累计）：{oor}</p>"
             f"<p class='small'>判定序列（各时刻有效探头最低校正温度）：{series}</p>"
         )
     # 在炉固化进度与安全出炉预测（与炉次详情/JSON 档案同一进度快照）

@@ -53,6 +53,7 @@ REASON_OVER_TEMP = "OVER_TEMP"                  # 最新读数超温（高于窗
 REASON_STALE_READING = "STALE_READING"          # 最新读数超时未更新（缺报）
 REASON_INSUFFICIENT_PROBES = "INSUFFICIENT_PROBES"  # 有效探头数量不足
 ALERT_OVER_TEMP_HISTORY = "OVER_TEMP_HISTORY"   # 历史上曾超温（最新读数已恢复）
+ALERT_CALIBRATION_RANGE = "CALIBRATION_RANGE"   # 读数超出校准点列区间，未计入保温累计
 
 
 def _iso(dt):
@@ -123,7 +124,7 @@ def project_item(readings, probe_cfg, temp_min, temp_max, hold_minutes,
         readings, probe_cfg, temp_min, temp_max, hold_minutes,
         gap_threshold_minutes, divergence_c, stuck_min_consecutive,
         min_valid_probes, window_end=as_of)
-    channels, per_probe, active = probes.split_channels(readings, probe_cfg)
+    channels, per_probe, active, _ = probes.split_channels(readings, probe_cfg)
 
     series = [(datetime.fromisoformat(p["ts"]), float(p["temp_c"]))
               for p in analysis["judgment_series"]]
@@ -185,6 +186,11 @@ def project_item(readings, probe_cfg, temp_min, temp_max, hold_minutes,
         "safe_unload_at": _iso(safe_at),
         "blockers": blockers,
         "alerts": alerts,
+        # 绑定校准证书版本的探头：证书版本/插值区间/到期状态（质量追溯）
+        "calibrations": [
+            {"probe_id": p["probe_id"], **p["calibration"]}
+            for p in analysis["probes"] if p.get("calibration")
+        ],
     }
 
 
@@ -233,6 +239,11 @@ def _alerts(analysis, series, temp_min, temp_max, as_of,
                     "message": f"截至 {_iso(as_of)} 尚无有效测温读数"})
         if analysis["insufficient_probes"]:
             out.append(_insufficient(analysis))
+        if analysis["calibration_range"]:
+            out.append({"code": ALERT_CALIBRATION_RANGE,
+                        "message": f"存在 {len(analysis['calibration_range'])} 个"
+                                   "超出校准点列区间的读数，未计入保温累计",
+                        "readings": analysis["calibration_range"]})
         return out
 
     latest_ts, latest_temp = series[-1]
@@ -274,6 +285,11 @@ def _alerts(analysis, series, temp_min, temp_max, as_of,
                     "message": f"存在 {len(analysis['divergences'])} 个时刻"
                                "有效探头温差超阈值",
                     "points": analysis["divergences"]})
+    if analysis["calibration_range"]:
+        out.append({"code": ALERT_CALIBRATION_RANGE,
+                    "message": f"存在 {len(analysis['calibration_range'])} 个"
+                               "超出校准点列区间的读数，未计入保温累计",
+                    "readings": analysis["calibration_range"]})
     return out
 
 

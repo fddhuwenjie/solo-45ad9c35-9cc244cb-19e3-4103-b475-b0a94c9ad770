@@ -121,12 +121,28 @@ CREATE TABLE IF NOT EXISTS readings (
 
 -- 工件探头登记（主数据）：校准偏移；签发时快照进 batch_item_probes 冻结
 CREATE TABLE IF NOT EXISTS probes (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    workpiece_id TEXT NOT NULL REFERENCES workpieces(id),
-    probe_id     TEXT NOT NULL,            -- 探头编号（同一工件内唯一）
-    offset_c     REAL NOT NULL DEFAULT 0,  -- 校准偏移：校正温度 = 原始值 + 偏移
-    created_at   TEXT NOT NULL,
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    workpiece_id   TEXT NOT NULL REFERENCES workpieces(id),
+    probe_id       TEXT NOT NULL,            -- 探头编号（同一工件内唯一）
+    offset_c       REAL NOT NULL DEFAULT 0,  -- 校准偏移：校正温度 = 原始值 + 偏移
+    calibration_id INTEGER,                  -- 绑定的校准证书版本；NULL 表示固定偏移模式
+    created_at     TEXT NOT NULL,
     UNIQUE (workpiece_id, probe_id)
+);
+
+-- 探头校准证书版本（不可覆盖）：多点示值—参考值点列；新证书追加新版本，
+-- 已录入版本不可修改/删除，已签发炉次仍用签发时冻结的快照
+CREATE TABLE IF NOT EXISTS probe_calibrations (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    workpiece_id   TEXT NOT NULL,
+    probe_id       TEXT NOT NULL,
+    version        INTEGER NOT NULL,         -- 该探头的证书版本序号（1 起，只增不改）
+    certificate_no TEXT NOT NULL,            -- 证书号
+    calibrated_at  TEXT NOT NULL,            -- 校准时刻
+    valid_until    TEXT NOT NULL,            -- 到期时刻
+    points_json    TEXT NOT NULL,            -- 示值—参考值点列（示值严格递增，≥2 点）
+    created_at     TEXT NOT NULL,
+    UNIQUE (workpiece_id, probe_id, version)
 );
 
 -- 签发时冻结的探头配置快照；出炉前可停用故障探头（DISABLED）
@@ -138,6 +154,13 @@ CREATE TABLE IF NOT EXISTS batch_item_probes (
     status          TEXT NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE / DISABLED
     disabled_reason TEXT,
     disabled_at     TEXT,
+    -- 签发时冻结的校准证书版本快照（未绑定校准版本的探头为 NULL）
+    calibration_id  INTEGER,
+    version         INTEGER,               -- 证书版本序号
+    certificate_no  TEXT,
+    calibrated_at   TEXT,
+    valid_until     TEXT,
+    points_json     TEXT,                  -- 冻结的示值—参考值点列（插值依据）
     PRIMARY KEY (batch_id, workpiece_id, probe_id)
 );
 
@@ -248,6 +271,17 @@ def init_db():
     db.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_readings_dedup ON readings"
         " (batch_id, workpiece_id, COALESCE(probe_id, ''), ts)")
+    # 兼容旧库：probes 补校准证书版本绑定列
+    existing = {r["name"] for r in db.execute("PRAGMA table_info(probes)")}
+    if "calibration_id" not in existing:
+        db.execute("ALTER TABLE probes ADD COLUMN calibration_id INTEGER")
+    # 兼容旧库：batch_item_probes 补签发冻结的校准证书快照列
+    existing = {r["name"] for r in db.execute("PRAGMA table_info(batch_item_probes)")}
+    for col, typ in {"calibration_id": "INTEGER", "version": "INTEGER",
+                     "certificate_no": "TEXT", "calibrated_at": "TEXT",
+                     "valid_until": "TEXT", "points_json": "TEXT"}.items():
+        if col not in existing:
+            db.execute(f"ALTER TABLE batch_item_probes ADD COLUMN {col} {typ}")
     db.commit()
 
 

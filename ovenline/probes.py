@@ -1,7 +1,11 @@
 """多探头测温判定：校准偏移、判定序列合成与探头异常检测（纯函数）。
 
 判定口径：
-- 校正温度 = 探头原始值 + 校准偏移（偏移取签发时冻结的探头配置）；
+- 校正温度：探头绑定校准证书版本（多点示值—参考值点列）时按冻结点列
+  **线性插值**（校正温度 = 原始示值在点列上的插值参考值）；未绑定证书版本
+  的探头按固定偏移（校正温度 = 原始值 + 校准偏移，偏移取签发时冻结的配置）；
+- 原始示值超出点列区间的读数**不计入保温累计**（不参与判定序列），
+  并产生 CALIBRATION_RANGE 告警（原始读数仍完整保留在 readings 表）；
 - 判定序列 = 每个采样时刻各有效（未停用）探头校正温度的最低值，
   固化窗口分钟数按该序列累计，各探头原始值仍完整保留在 readings 表；
 - 异常检测：同一探头连续相同读数（STUCK_PROBE 卡值）、
@@ -17,31 +21,74 @@ from datetime import timedelta
 from . import cure
 
 
+def interpolate(points, raw):
+    """按示值—参考值点列线性插值；raw 超出点列示值区间时返回 None。
+
+    points: [(示值, 参考值), ...]，已按示值严格递增排序（录入时校验）。
+    """
+    if raw < points[0][0] or raw > points[-1][0]:
+        return None
+    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+        if raw <= x1:
+            t = (raw - x0) / (x1 - x0)
+            return y0 + t * (y1 - y0)
+    return points[-1][1]  # raw 恰为末点示值
+
+
 def split_channels(readings, probe_cfg):
     """把原始读数按探头通道拆分为校正后序列（analyze 的纯数据部分）。
 
     readings:  [(ts datetime, probe_id|None, 原始温度℃)]
-    probe_cfg: {probe_id: {"offset_c": float, "status": "ACTIVE"/"DISABLED"}}
-    返回 (channels, per_probe, active)：
-      channels  = {probe_id: {"offset_c", "status"}}（含隐式单通道 None）
-      per_probe = {probe_id: [(ts, 校正温度), ...]}（已按时间排序）
-      active    = 状态为 ACTIVE 的探头编号列表
+    probe_cfg: {probe_id: {"offset_c": float, "status": "ACTIVE"/"DISABLED",
+                           "points": [(示值, 参考值), ...] | None,
+                           "calibration": 证书版本视图 | None}}
+    返回 (channels, per_probe, active, out_of_range)：
+      channels     = {probe_id: {"offset_c", "status", "points", "calibration"}}
+                     （含隐式单通道 None）
+      per_probe    = {probe_id: [(ts, 校正温度), ...]}（已按时间排序；
+                     绑定证书版本的探头只含点列区间内的读数）
+      active       = 状态为 ACTIVE 的探头编号列表
+      out_of_range = 超出点列区间的读数告警明细（CALIBRATION_RANGE）
     """
-    channels = {pid: {"offset_c": float(c["offset_c"]), "status": c["status"]}
-                for pid, c in probe_cfg.items()}
+    channels = {}
+    for pid, c in probe_cfg.items():
+        pts = c.get("points")
+        channels[pid] = {
+            "offset_c": float(c["offset_c"]),
+            "status": c["status"],
+            "points": ([(float(x), float(y)) for x, y in pts] if pts else None),
+            "calibration": c.get("calibration"),
+        }
     per_probe = {pid: [] for pid in channels}
+    out_of_range = []
     for ts, pid, raw in readings:
         if pid is None:
             # 隐式单通道：未登记探头的工件，偏移按 0 计
-            channels.setdefault(None, {"offset_c": 0.0, "status": "ACTIVE"})
+            channels.setdefault(None, {"offset_c": 0.0, "status": "ACTIVE",
+                                       "points": None, "calibration": None})
             per_probe.setdefault(None, []).append((ts, float(raw)))
         elif pid in channels:
-            per_probe[pid].append((ts, float(raw) + channels[pid]["offset_c"]))
+            ch = channels[pid]
+            if ch["points"]:
+                corrected = interpolate(ch["points"], float(raw))
+                if corrected is None:
+                    # 示值超出证书点列区间：不计入保温累计，保留告警
+                    out_of_range.append({
+                        "probe_id": pid,
+                        "ts": ts.isoformat(timespec="seconds"),
+                        "raw_c": float(raw),
+                        "range_min_c": ch["points"][0][0],
+                        "range_max_c": ch["points"][-1][0],
+                    })
+                    continue
+                per_probe[pid].append((ts, corrected))
+            else:
+                per_probe[pid].append((ts, float(raw) + ch["offset_c"]))
         # 未绑定探头的读数在入库前已被拒收；此处防御性忽略
     for pts in per_probe.values():
         pts.sort(key=lambda p: p[0])
     active = [pid for pid, c in channels.items() if c["status"] == "ACTIVE"]
-    return channels, per_probe, active
+    return channels, per_probe, active, out_of_range
 
 
 def analyze(readings, probe_cfg, temp_min, temp_max, hold_minutes,
@@ -51,15 +98,18 @@ def analyze(readings, probe_cfg, temp_min, temp_max, hold_minutes,
 
     readings:  [(ts datetime, probe_id|None, 原始温度℃)]，顺序不限；
                probe_id 为 None 表示未登记探头工件的隐式单通道读数
-    probe_cfg: {probe_id: {"offset_c": float, "status": "ACTIVE"/"DISABLED"}}
+    probe_cfg: {probe_id: {"offset_c": float, "status": "ACTIVE"/"DISABLED",
+                           "points": [(示值, 参考值), ...] | None,
+                           "calibration": 证书版本视图 | None}}
                签发快照或当前主数据；空 dict 表示该工件未登记探头
     window_end: 进度查询的计算基准时刻：缺报测量窗口末端取该时刻
                （尾随缺报据此判定，探头有效性随之变化）；
                None 时窗口末端取全体启用探头的最晚读数（出炉判定口径）
-    返回: 固化判定 dict（cure.evaluate 字段 + 判定序列/探头状态/异常区间）
+    返回: 固化判定 dict（cure.evaluate 字段 + 判定序列/探头状态/异常区间
+          + 校准区间外读数告警）
     """
-    # 校正温度按探头通道归集
-    channels, per_probe, active = split_channels(readings, probe_cfg)
+    # 校正温度按探头通道归集（点列区间外读数剔除并记录告警）
+    channels, per_probe, active, out_of_range = split_channels(readings, probe_cfg)
 
     # 判定序列：每个采样时刻取有效探头校正温度的最低值
     lowest = {}
@@ -78,6 +128,9 @@ def analyze(readings, probe_cfg, temp_min, temp_max, hold_minutes,
                                     window_end=window_end)
 
     # 卡值检测：逐探头（含已停用，保留其异常区间备查）
+    oor_count = {}
+    for o in out_of_range:
+        oor_count[o["probe_id"]] = oor_count.get(o["probe_id"], 0) + 1
     probes_out = []
     for pid, ch in channels.items():
         pts = per_probe.get(pid, [])
@@ -85,7 +138,10 @@ def analyze(readings, probe_cfg, temp_min, temp_max, hold_minutes,
             "probe_id": pid,
             "offset_c": ch["offset_c"],
             "status": ch["status"],
+            # 证书版本视图（证书号/版本/插值区间/到期状态），未绑定为 None
+            "calibration": ch.get("calibration"),
             "reading_count": len(pts),
+            "out_of_range_count": oor_count.get(pid, 0),
             "min_c": min((t for _, t in pts), default=None),
             "max_c": max((t for _, t in pts), default=None),
             "anomalies": _stuck_runs(pid, pts, stuck_min_consecutive,
@@ -100,6 +156,8 @@ def analyze(readings, probe_cfg, temp_min, temp_max, hold_minutes,
                              "temp_c": t} for ts, t in series],
         "probes": probes_out,
         "divergences": _divergences(per_probe, active, divergence_c),
+        # 超出校准点列区间的读数（未计入保温累计）
+        "calibration_range": out_of_range,
         "valid_probe_count": valid_count,
         "min_valid_probes": min_valid_probes,
         "insufficient_probes": valid_count < min_valid_probes,

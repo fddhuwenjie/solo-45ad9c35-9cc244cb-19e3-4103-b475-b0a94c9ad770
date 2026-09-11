@@ -7,9 +7,15 @@
 许可区间的**累计分钟数**判定固化是否充分；混炉须同时满足各粉料固化窗口交集、
 同炉禁配组、工件间距（挂位）与吊具承重。
 
-多探头：同一工件可登记**多个金属探头**同步测温（各带校准偏移），签发时冻结配置；
-判定序列取**每个采样时刻有效探头的最低校正温度**，单个探头松脱、卡值或漂移
-不会直接决定整件返工——可在出炉前停用故障探头，系统只重算该工件并记录结果变化。
+多探头：同一工件可登记**多个金属探头**同步测温（各带校准偏移或绑定校准证书
+版本），签发时冻结配置；判定序列取**每个采样时刻有效探头的最低校正温度**，
+单个探头松脱、卡值或漂移不会直接决定整件返工——可在出炉前停用故障探头，
+系统只重算该工件并记录结果变化。
+
+校准证书版本化：探头可录入**不可覆盖的多点校准版本**（证书号、校准/到期时刻、
+示值—参考值点列），绑定探头时指定版本；签发按计划入炉时刻检查证书有效期与
+粉料温区覆盖；测温按签发时冻结的点列**线性插值**，区间外读数不计入保温累计；
+新证书只供未签发炉次使用，各炉次采用的证书版本全程可追溯。
 
 ## 快速开始
 
@@ -23,6 +29,7 @@ bash samples/scenario_b_conflicts_rework.sh   # 冲突/越序/返工/版本链
 bash samples/scenario_c_probes.sh             # 多探头测温/停用故障探头
 bash samples/scenario_d_piece_unload.sh       # 轻薄/厚重混炉逐件出炉、强制出炉
 bash samples/scenario_e_blackout.sh           # 停机窗避让/冲突/逐炉时间线
+bash samples/scenario_f_calibrations.sh       # 探头校准证书版本化/签发检查/插值
 
 # 回归测试（不依赖服务进程）
 python3 -m unittest discover -s tests -v
@@ -48,6 +55,7 @@ samples/
   scenario_c_probes.sh             样例三：多探头测温
   scenario_d_piece_unload.sh       样例四：逐件出炉/强制出炉
   scenario_e_blackout.sh           样例五：停机窗避让/冲突/时间线
+  scenario_f_calibrations.sh       样例六：校准证书版本化/签发检查/插值
   out/                             样例下载产物（档案 JSON、随炉卡 HTML）
 ```
 
@@ -118,6 +126,34 @@ samples/
   （默认 1）时 → `INSUFFICIENT_PROBES`，**不得判定合格**；
 - 炉次详情、JSON 档案与随炉卡均列出：探头状态/校准偏移/异常区间（含缺报
   区间的起止时间与时长）/探头处置审计，以及最终采用的判定序列。
+
+### 探头校准证书版本化
+固定偏移之外，探头可登记**多点校准证书版本**，全程追溯各炉次采用的校准：
+- `POST /workpieces/<wid>/probes/<pid>/calibrations` 录入版本：
+  `certificate_no`（证书号）、`calibrated_at`（校准时刻）、
+  `valid_until`（到期时刻）、`points`（示值—参考值点列，
+  `[{"indicated_c","reference_c"}, ...]`）。**少于两点、校准/到期时刻倒置、
+  点列示值不递增一律 400 拒绝**；每次录入追加新版本（`version` 自增），
+  已录入版本**不可覆盖**（无修改/删除接口）；
+- `GET /workpieces/<wid>/probes/<pid>/calibrations` 查询历史版本
+  （按版本升序，含点列与插值区间）；
+- **绑定探头时指定版本**：`POST /workpieces/<id>/probes` 的探头条目可带
+  `calibration_id`（须属于该探头，否则 400）；不带该键保留既有绑定，
+  显式传 `null` 解除绑定；未绑定版本的探头保持固定偏移模式；
+- **签发检查**：签发炉次按**计划入炉时刻**核对每个绑定探头的证书——
+  版本缺失（`CALIBRATION_MISSING`）、尚未生效（`CALIBRATION_NOT_YET_VALID`）、
+  已过期（`CALIBRATION_EXPIRED`）、点列区间未覆盖该工件粉料温区
+  （`CALIBRATION_COVERAGE`）时，响应 409 并在 `calibration_problems` 中
+  逐条列出相关工件、探头与原因，**阻止签发**（炉次保持 DRAFT，
+  换证/改绑后可重新签发）；
+- 签发时把证书版本与点列**冻结进炉次快照**（`batch_item_probes`），
+  **新证书只供未签发炉次使用**，已签发炉次的判定不受换证影响；
+- **测温插值**：绑定版本的探头按冻结点列对原始示值**线性插值**得到校正
+  温度；**超出点列区间的读数不计入保温累计**（不参与判定序列与超温判定，
+  原始值仍保留在 readings 表），并产生 `CALIBRATION_RANGE` 告警
+  （进度响应 alerts 与固化分析 `calibration_range` 明细）；
+- 批次查询、进度响应（`calibrations`）、JSON 档案与随炉卡均保留
+  **证书版本、插值区间及到期状态**（相对计划入炉时刻判定 `expired`）。
 
 ### 固化判定（出炉判定）
 已签发炉次按**签发时快照**的工件尺寸与粉料窗口评估（草稿炉次按当前主数据）：
@@ -202,9 +238,10 @@ samples/
 - **停机窗随版本快照存档**（`blackout_windows` 表 + 版本参数），后续试算可
   整体改写；新窗口撞上已签发/在炉炉次时在 `blackout_conflicts` 中列出
   重叠区间与冲突分钟，这些炉次时刻不变；
-- 签发时对炉内工件的尺寸、重量、粉料固化窗口与**探头配置**做快照
-  （`batch_items.snap_*` / `batch_item_probes`），
-  后续修改主数据或生成新版本，均不改变已签发炉次的查询结果与出炉判定；
+- 签发时对炉内工件的尺寸、重量、粉料固化窗口与**探头配置**（含校准证书
+  版本与点列）做快照（`batch_items.snap_*` / `batch_item_probes`），
+  后续修改主数据、录入新证书或生成新版本，均不改变已签发炉次的查询结果
+  与出炉判定；
 - 旧草稿作废（`SUPERSEDED`），待排产工件（含返工件）重新编排（`new_batches`）。
 
 ## API 一览（前缀 `/api`）
@@ -212,15 +249,17 @@ samples/
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/schedule/trial` | 试算：排出炉次/挂位/升温/保温/出炉时刻（避让停机窗），形成关联版本；响应含逐炉时间线与停机冲突清单 |
-| POST | `/batches/<id>/issue` | 签发（DRAFT→ISSUED，冻结工件/粉料/探头快照） |
+| POST | `/batches/<id>/issue` | 签发（DRAFT→ISSUED，冻结工件/粉料/探头/校准证书快照；证书缺失/未生效/过期/温区覆盖不足时 409 阻止） |
 | POST | `/batches/<id>/load` | 入炉（ISSUED→IN_OVEN），body 可带 `at` |
 | POST | `/batches/<id>/readings` | 测温回传（仅 IN_OVEN 且工件仍在炉），`readings:[{workpiece_id,probe_id,ts,metal_temp_c}]`，接受后即时重算进度 |
 | GET  | `/batches/<id>/progress` | 在炉固化进度与安全出炉预测（可带 `?as_of=` 计算基准，逐件状态/阻塞/告警，炉次级最晚安全出炉与计划过早分钟）；**汇总仅计算仍在炉工件** |
 | POST | `/batches/<id>/workpieces/<wid>/unload` | **逐件出炉**：按 `at` 判定单件；不达标普通请求 409（给累计/剩余/阻塞原因），`force=true`+`reason` 强制出炉（不合格+审计） |
 | POST | `/batches/<id>/unload` | 整炉出炉判定：逐件复用同一判定，**已离炉工件跳过**；最后一件离炉后炉次 UNLOADED |
 | POST | `/batches/<id>/close` | 炉次结案（存在未了结工件时 409 并列出） |
-| POST | `/workpieces/<id>/probes` | 登记/更新工件探头及校准偏移（签发时冻结快照） |
-| GET  | `/workpieces/<id>/probes` | 工件已登记探头列表 |
+| POST | `/workpieces/<id>/probes` | 登记/更新工件探头及校准偏移，可带 `calibration_id` 绑定校准版本（签发时冻结快照） |
+| GET  | `/workpieces/<id>/probes` | 工件已登记探头列表（含绑定的证书版本摘要） |
+| POST | `/workpieces/<wid>/probes/<pid>/calibrations` | 录入探头校准证书版本（不可覆盖；少于两点/时间倒置/点列不递增拒绝） |
+| GET  | `/workpieces/<wid>/probes/<pid>/calibrations` | 探头校准证书历史版本（含点列与插值区间） |
 | POST | `/batches/<bid>/workpieces/<wid>/probes/<pid>/disable` | 出炉前停用故障探头（须 `reason`），只重算该工件并记录结果变化 |
 | POST | `/workpieces/<id>/rework` | 返工：回到待排产队列 |
 | POST | `/workpieces/<id>/close` | 工件结案（合格入库/报废注明 note） |
